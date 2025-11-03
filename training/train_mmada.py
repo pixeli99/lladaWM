@@ -208,15 +208,20 @@ def main():
     mmada_config = MMadaConfig(**merged_config)
     llm_vocab_size = tokenizer_vocab_size
     total_vocab_size = llm_vocab_size + mmada_config.codebook_size
+    model = MMadaModelLM.from_pretrained(
+        config.model.mmada.pretrained_model_path,
+        torch_dtype=torch.bfloat16,
+        config=mmada_config,
+    )
+    model.resize_token_embeddings(total_vocab_size)
+    model.config.llm_vocab_size = llm_vocab_size
+    model.config.vocab_size = total_vocab_size
+    model.config.new_vocab_size = total_vocab_size
+    model.config.embedding_size = total_vocab_size
     mmada_config.llm_vocab_size = llm_vocab_size
     mmada_config.vocab_size = total_vocab_size
     mmada_config.new_vocab_size = total_vocab_size
     mmada_config.embedding_size = total_vocab_size
-    model = MMadaModelLM.from_pretrained(config.model.mmada.pretrained_model_path, torch_dtype=torch.bfloat16, config=mmada_config)
-    model.resize_token_embeddings(total_vocab_size)
-    model.config.vocab_size = total_vocab_size
-    model.config.new_vocab_size = total_vocab_size
-    model.config.embedding_size = total_vocab_size
     model = model.to(accelerator.device)
 
     mask_id = model.config.mask_token_id
