@@ -522,104 +522,6 @@ def main():
 
     navsim_only_mode = navsim_enabled and not (enable_t2i or enable_lm or enable_mmu)
 
-    def run_navsim_only_training(num_train_epochs_local):
-        nonlocal global_step, first_epoch
-
-        logger.info("Running NavSim-only training loop.")
-        batch_time_m = AverageMeter()
-        data_time_m = AverageMeter()
-        end_local = time.time()
-
-        for epoch in range(first_epoch, num_train_epochs_local):
-            model.train()
-            for navsim_batch in navsim_loader:
-                data_time_m.update(time.time() - end_local)
-                input_ids_navsim, labels_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
-                batch_size_navsim = input_ids_navsim.shape[0]
-
-                with accelerator.accumulate(model):
-                    logits, loss_t2i, loss_lm, loss_mmu, loss_navsim = model.forward_process(
-                        input_ids=input_ids_navsim,
-                        labels=labels_navsim,
-                        batch_size_t2i=0,
-                        batch_size_lm=0,
-                        batch_size_mmu=0,
-                        batch_size_navsim=batch_size_navsim,
-                        max_seq_length=config.dataset.preprocessing.max_seq_length,
-                        p_mask_lm=None,
-                        p_mask_mmu=None,
-                        answer_lengths=None,
-                        t2i_masks=None,
-                    )
-                    loss = navsim_coeff * loss_navsim
-                    accelerator.backward(loss)
-
-                    if config.training.max_grad_norm is not None and accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
-
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-
-                if accelerator.sync_gradients:
-                    batch_time_m.update(time.time() - end_local)
-                    end_local = time.time()
-
-                    avg_loss_navsim = accelerator.gather(
-                        loss_navsim.repeat(max(1, batch_size_navsim))
-                    ).mean()
-                    if (global_step + 1) % config.experiment.log_every == 0:
-                        samples_per_second_per_gpu = (
-                            config.training.gradient_accumulation_steps
-                            * max(1, config.training.batch_size_navsim)
-                            / max(batch_time_m.val, 1e-8)
-                        )
-                        logs = {
-                            "step_loss_navsim": avg_loss_navsim.item(),
-                            "lr": lr_scheduler.get_last_lr()[0],
-                            "samples/sec/gpu": samples_per_second_per_gpu,
-                            "data_time": data_time_m.val,
-                            "batch_time": batch_time_m.val,
-                        }
-                        accelerator.log(logs, step=global_step + 1)
-                        logger.info(
-                            f"Step: {global_step + 1} "
-                            f"Loss_navsim: {avg_loss_navsim.item():0.4f} "
-                            f"Data (t): {data_time_m.val:0.4f}, {samples_per_second_per_gpu:0.2f}/s/gpu "
-                            f"Batch (t): {batch_time_m.val:0.4f} "
-                            f"LR: {lr_scheduler.get_last_lr()[0]:0.6f}"
-                        )
-                        batch_time_m.reset()
-                        data_time_m.reset()
-
-                    if (
-                        accelerator.sync_gradients
-                        and (global_step + 1) % config.experiment.log_grad_norm_every == 0
-                        and accelerator.is_main_process
-                    ):
-                        log_grad_norm(model, accelerator, global_step + 1)
-
-                    if (global_step + 1) % config.experiment.save_every == 0:
-                        save_checkpoint(model, config, accelerator, global_step + 1)
-
-                global_step += 1
-                if global_step >= config.training.max_train_steps:
-                    break
-
-            if global_step >= config.training.max_train_steps:
-                break
-
-        accelerator.wait_for_everyone()
-        save_checkpoint(model, config, accelerator, global_step)
-        if accelerator.is_main_process:
-            model_to_save = accelerator.unwrap_model(model)
-            model_to_save.save_pretrained(config.experiment.output_dir, safe_serialization=True)
-        accelerator.end_training()
-
-    if navsim_only_mode:
-        run_navsim_only_training(num_train_epochs)
-        return
-
     ##################################
     #       Prepare accelerator     #
     #################################
@@ -745,7 +647,103 @@ def main():
 
         return noisy_batch, labels_mmu, p_mask, answer_lengths
 
+    def run_navsim_only_training(num_train_epochs_local):
+        nonlocal global_step, first_epoch
 
+        logger.info("Running NavSim-only training loop.")
+        batch_time_m = AverageMeter()
+        data_time_m = AverageMeter()
+        end_local = time.time()
+
+        for epoch in range(first_epoch, num_train_epochs_local):
+            model.train()
+            for navsim_batch in navsim_loader:
+                data_time_m.update(time.time() - end_local)
+                input_ids_navsim, labels_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
+                batch_size_navsim = input_ids_navsim.shape[0]
+
+                with accelerator.accumulate(model):
+                    logits, loss_t2i, loss_lm, loss_mmu, loss_navsim = model.forward_process(
+                        input_ids=input_ids_navsim,
+                        labels=labels_navsim,
+                        batch_size_t2i=0,
+                        batch_size_lm=0,
+                        batch_size_mmu=0,
+                        batch_size_navsim=batch_size_navsim,
+                        max_seq_length=config.dataset.preprocessing.max_seq_length,
+                        p_mask_lm=None,
+                        p_mask_mmu=None,
+                        answer_lengths=None,
+                        t2i_masks=None,
+                    )
+                    loss = navsim_coeff * loss_navsim
+                    accelerator.backward(loss)
+
+                    if config.training.max_grad_norm is not None and accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
+
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                if accelerator.sync_gradients:
+                    batch_time_m.update(time.time() - end_local)
+                    end_local = time.time()
+
+                    avg_loss_navsim = accelerator.gather(
+                        loss_navsim.repeat(max(1, batch_size_navsim))
+                    ).mean()
+                    if (global_step + 1) % config.experiment.log_every == 0:
+                        samples_per_second_per_gpu = (
+                            config.training.gradient_accumulation_steps
+                            * max(1, config.training.batch_size_navsim)
+                            / max(batch_time_m.val, 1e-8)
+                        )
+                        logs = {
+                            "step_loss_navsim": avg_loss_navsim.item(),
+                            "lr": lr_scheduler.get_last_lr()[0],
+                            "samples/sec/gpu": samples_per_second_per_gpu,
+                            "data_time": data_time_m.val,
+                            "batch_time": batch_time_m.val,
+                        }
+                        accelerator.log(logs, step=global_step + 1)
+                        logger.info(
+                            f"Step: {global_step + 1} "
+                            f"Loss_navsim: {avg_loss_navsim.item():0.4f} "
+                            f"Data (t): {data_time_m.val:0.4f}, {samples_per_second_per_gpu:0.2f}/s/gpu "
+                            f"Batch (t): {batch_time_m.val:0.4f} "
+                            f"LR: {lr_scheduler.get_last_lr()[0]:0.6f}"
+                        )
+                        batch_time_m.reset()
+                        data_time_m.reset()
+
+                    if (
+                        accelerator.sync_gradients
+                        and (global_step + 1) % config.experiment.log_grad_norm_every == 0
+                        and accelerator.is_main_process
+                    ):
+                        log_grad_norm(model, accelerator, global_step + 1)
+
+                    if (global_step + 1) % config.experiment.save_every == 0:
+                        save_checkpoint(model, config, accelerator, global_step + 1)
+
+                global_step += 1
+                if global_step >= config.training.max_train_steps:
+                    break
+
+            if global_step >= config.training.max_train_steps:
+                break
+
+        accelerator.wait_for_everyone()
+        save_checkpoint(model, config, accelerator, global_step)
+        if accelerator.is_main_process:
+            model_to_save = accelerator.unwrap_model(model)
+            model_to_save.save_pretrained(config.experiment.output_dir, safe_serialization=True)
+        accelerator.end_training()
+
+    if navsim_only_mode:
+        run_navsim_only_training(num_train_epochs)
+        return
 
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
