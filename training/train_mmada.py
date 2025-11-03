@@ -206,7 +206,7 @@ def main():
     mmada_config_dict = {k: v for k, v in config.model.mmada.items()}
     merged_config = {**base_config, **mmada_config_dict}
     mmada_config = MMadaConfig(**merged_config)
-    total_vocab_size = tokenizer_vocab_size
+    total_vocab_size = mmada_config.new_vocab_size + len(navsim_token_list)
     model = MMadaModelLM.from_pretrained(
         config.model.mmada.pretrained_model_path,
         torch_dtype=torch.bfloat16,

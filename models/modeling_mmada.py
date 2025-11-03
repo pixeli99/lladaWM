@@ -226,7 +226,14 @@ class MMadaModelLM(LLaDAModelLM):
             answer_lengths_lm=None
             ):
         # attention bias, True for batch_size, 1, seq_len, seq_len  
-        attention_bias = torch.ones(input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1])
+        attention_bias = torch.ones(
+            input_ids.shape[0],
+            1,
+            input_ids.shape[1],
+            input_ids.shape[1],
+            device=input_ids.device,
+            dtype=torch.bool,
+        )
         if batch_size_t2i > 0 and t2i_masks is not None:
             attention_bias_t2i = (t2i_masks[:, :, None] & t2i_masks[:, None, :]).bool().unsqueeze(1)
             attention_bias[:batch_size_t2i] = attention_bias_t2i
@@ -304,7 +311,14 @@ class MMadaModelLM(LLaDAModelLM):
             answer_lengths_r2i=None,
             ):
         # attention bias, True for batch_size, 1, seq_len, seq_len  
-        attention_bias = torch.ones(input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1])
+        attention_bias = torch.ones(
+            input_ids.shape[0],
+            1,
+            input_ids.shape[1],
+            input_ids.shape[1],
+            device=input_ids.device,
+            dtype=torch.bool,
+        )
         attention_bias_t2i = (t2i_masks[:, :, None] & t2i_masks[:, None, :]).bool().unsqueeze(1)
         attention_bias[:batch_size_t2i] = attention_bias_t2i
         logits = self(input_ids, attention_bias=attention_bias).logits 
@@ -376,7 +390,14 @@ class MMadaModelLM(LLaDAModelLM):
             t2i_masks=None
             ):
         # attention bias, True for batch_size, 1, seq_len, seq_len  
-        attention_bias = torch.ones(input_ids.shape[0], 1, input_ids.shape[1], input_ids.shape[1])
+        attention_bias = torch.ones(
+            input_ids.shape[0],
+            1,
+            input_ids.shape[1],
+            input_ids.shape[1],
+            device=input_ids.device,
+            dtype=torch.bool,
+        )
         attention_bias_t2i = (t2i_masks[:, :, None] & t2i_masks[:, None, :]).bool().unsqueeze(1)
         attention_bias[:batch_size_t2i] = attention_bias_t2i
         logits = self(input_ids, attention_bias=attention_bias).logits 
