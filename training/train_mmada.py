@@ -180,13 +180,7 @@ def main():
 
     print('special tokens : \n', uni_prompting.sptids_dict)
 
-    navsim_special_tokens = [
-        "<|navsim|>",
-        "<nav_hist_sep>",
-        "<nav_action_sep>",
-        "<nav_future_sep>",
-    ]
-    navsim_token_list = navsim_special_tokens + action_token_vocab()
+    navsim_token_list = action_token_vocab()
     uni_prompting.register_tokens(navsim_token_list)
     tokenizer_vocab_size = len(tokenizer)
 
@@ -206,22 +200,15 @@ def main():
     mmada_config_dict = {k: v for k, v in config.model.mmada.items()}
     merged_config = {**base_config, **mmada_config_dict}
     mmada_config = MMadaConfig(**merged_config)
-    llm_vocab_size = tokenizer_vocab_size
-    total_vocab_size = llm_vocab_size + mmada_config.codebook_size
+    total_vocab_size = tokenizer_vocab_size
     model = MMadaModelLM.from_pretrained(
         config.model.mmada.pretrained_model_path,
         torch_dtype=torch.bfloat16,
-        config=mmada_config,
     )
     model.resize_token_embeddings(total_vocab_size)
-    model.config.llm_vocab_size = llm_vocab_size
     model.config.vocab_size = total_vocab_size
     model.config.new_vocab_size = total_vocab_size
     model.config.embedding_size = total_vocab_size
-    mmada_config.llm_vocab_size = llm_vocab_size
-    mmada_config.vocab_size = total_vocab_size
-    mmada_config.new_vocab_size = total_vocab_size
-    mmada_config.embedding_size = total_vocab_size
     model = model.to(accelerator.device)
 
     mask_id = model.config.mask_token_id
