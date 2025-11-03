@@ -280,8 +280,32 @@ def main():
     navsim_cfg = dataset_config.get("navsim", None) if hasattr(dataset_config, "get") else None
     navsim_enabled = bool(navsim_cfg and navsim_cfg.get("enabled", False))
 
+    def _is_nonempty(value):
+        if value is None:
+            return False
+        if isinstance(value, (list, tuple)):
+            return len(value) > 0
+        if isinstance(value, str):
+            return value != ""
+        return True
+
+    enable_t2i = config.training.batch_size_t2i > 0 and _is_nonempty(dataset_config.get("train_t2i_shards_path_or_url", None))
+    enable_lm = config.training.batch_size_lm > 0 and _is_nonempty(dataset_config.get("train_lm_shards_path_or_url", None))
+    enable_mmu = config.training.batch_size_mmu > 0 and _is_nonempty(dataset_config.get("train_mmu_shards_path_or_url", None))
+    if not enable_t2i:
+        logger.info("T2I flow disabled (batch size 0 or missing data path).")
+    if not enable_lm:
+        logger.info("LM flow disabled (batch size 0 or missing data path).")
+    if not enable_mmu:
+        logger.info("MMU flow disabled (batch size 0 or missing data path).")
+    if not navsim_enabled:
+        logger.info("NavSim flow disabled in config.")
+
+    num_update_steps_per_epoch = None
+    num_train_epochs = None
+
     # Data for generation
-    if config.dataset.gen_type == "t2i":
+    if enable_t2i and config.dataset.gen_type == "t2i":
         dataset = Text2ImageDataset(
             train_shards_path_or_url=dataset_config.train_t2i_shards_path_or_url,
             tokenizer=None,  # we want to get raw texts
@@ -304,7 +328,7 @@ def main():
             train_dataloader_t2i.num_batches / config.training.gradient_accumulation_steps)
         num_train_epochs = math.ceil(config.training.max_train_steps / num_update_steps_per_epoch)
 
-    elif config.dataset.gen_type == "t2i_parquet":
+    elif enable_t2i and config.dataset.gen_type == "t2i_parquet":
         # this part relies on the internal packages, which will not be released
         num_update_steps_per_epoch = math.ceil(config.experiment.max_train_examples_t2i / total_batch_size_t2i)
         num_train_epochs = math.ceil(config.training.max_train_steps / num_update_steps_per_epoch)
@@ -321,7 +345,7 @@ def main():
             shuffle_buffer_size=dataset_config.shuffle_buffer_size
         )
 
-    elif config.dataset.gen_type == "imagenet1k":
+    elif enable_t2i and config.dataset.gen_type == "imagenet1k":
         dataset_imagenet = ImageNetDataset(
             dataset_config.train_t2i_shards_path_or_url,
             image_size=preproc_config.resolution,
@@ -348,49 +372,54 @@ def main():
         num_update_steps_per_epoch = math.ceil(len(dataset_imagenet) / total_batch_size_t2i)
         num_train_epochs = math.ceil(config.training.max_train_steps / num_update_steps_per_epoch)
 
-    else:
+    elif enable_t2i:
         raise ValueError(f"Unsupported dataset type {config.dataset.type}")
+    else:
+        train_dataloader_t2i = None
 
     total_batch_size_mmu_without_accum = config.training.batch_size_mmu * accelerator.num_processes
-    # Data for image captioning
-    if config.dataset.und_type == "captioning":
-        dataset_mmu = Text2ImageDataset(
-            train_shards_path_or_url=dataset_config.train_mmu_shards_path_or_url,
-            tokenizer=None,  # we want to get raw texts
-            max_seq_length=preproc_config.max_seq_length,
-            num_train_examples=config.experiment.max_train_examples_mmu,
-            per_gpu_batch_size=config.training.batch_size_mmu,
-            global_batch_size=total_batch_size_mmu_without_accum,
-            num_workers=dataset_config.num_workers,
-            resolution=preproc_config.resolution,
-            shuffle_buffer_size=dataset_config.shuffle_buffer_size,
-            pin_memory=dataset_config.pin_memory,
-            persistent_workers=dataset_config.persistent_workers,
-            external_caption_path=dataset_config.external_caption_path,
-            external_journeydb_caption_path=dataset_config.external_journeydb_caption_path,
-            external_laion12m_caption_path=dataset_config.external_laion12m_caption_path,
-            external_cc12m_caption_path=dataset_config.external_cc12m_caption_path,
-            is_captioning=True,
-            add_caption_prompt=dataset_config.add_caption_prompt,
-        )
-        train_dataloader_mmu = dataset_mmu.train_dataloader
+    if enable_mmu:
+        # Data for image captioning
+        if config.dataset.und_type == "captioning":
+            dataset_mmu = Text2ImageDataset(
+                train_shards_path_or_url=dataset_config.train_mmu_shards_path_or_url,
+                tokenizer=None,  # we want to get raw texts
+                max_seq_length=preproc_config.max_seq_length,
+                num_train_examples=config.experiment.max_train_examples_mmu,
+                per_gpu_batch_size=config.training.batch_size_mmu,
+                global_batch_size=total_batch_size_mmu_without_accum,
+                num_workers=dataset_config.num_workers,
+                resolution=preproc_config.resolution,
+                shuffle_buffer_size=dataset_config.shuffle_buffer_size,
+                pin_memory=dataset_config.pin_memory,
+                persistent_workers=dataset_config.persistent_workers,
+                external_caption_path=dataset_config.external_caption_path,
+                external_journeydb_caption_path=dataset_config.external_journeydb_caption_path,
+                external_laion12m_caption_path=dataset_config.external_laion12m_caption_path,
+                external_cc12m_caption_path=dataset_config.external_cc12m_caption_path,
+                is_captioning=True,
+                add_caption_prompt=dataset_config.add_caption_prompt,
+            )
+            train_dataloader_mmu = dataset_mmu.train_dataloader
 
-    elif config.dataset.und_type == "captioning_parquet":
-        train_dataloader_mmu = create_imagetext_dataloader(
-            train_shards_path_or_url=dataset_config.train_mmu_shards_path_or_url,
-            batch_size=config.training.batch_size_mmu,
-            image_size=preproc_config.resolution,
-            num_workers=dataset_config.num_workers,
-            num_readers=32,
-            predefined_steps=num_update_steps_per_epoch,
-            drop_last=True,
-            shuffle=True,
-            shuffle_buffer_size=dataset_config.shuffle_buffer_size,
-            is_captioning=True
-        )
+        elif config.dataset.und_type == "captioning_parquet":
+            train_dataloader_mmu = create_imagetext_dataloader(
+                train_shards_path_or_url=dataset_config.train_mmu_shards_path_or_url,
+                batch_size=config.training.batch_size_mmu,
+                image_size=preproc_config.resolution,
+                num_workers=dataset_config.num_workers,
+                num_readers=32,
+                predefined_steps=num_update_steps_per_epoch,
+                drop_last=True,
+                shuffle=True,
+                shuffle_buffer_size=dataset_config.shuffle_buffer_size,
+                is_captioning=True
+            )
 
+        else:
+            raise NotImplementedError(f"Unsupported dataset type {config.dataset.und_type}")
     else:
-        raise NotImplementedError(f"Unsupported dataset type {config.dataset.und_type}")
+        train_dataloader_mmu = None
 
     navsim_loader = None
     if navsim_enabled:
@@ -411,25 +440,45 @@ def main():
         )
 
     # LLM pure text dataset: RefinedWeb
-    dataset_lm = RefinedWebDataset(data_path=dataset_config.train_lm_shards_path_or_url,
-                                   rank=accelerator.process_index,
-                                   world_size=accelerator.num_processes,
-                                   num_workers=dataset_config.num_workers)
+    if enable_lm:
+        dataset_lm = RefinedWebDataset(data_path=dataset_config.train_lm_shards_path_or_url,
+                                       rank=accelerator.process_index,
+                                       world_size=accelerator.num_processes,
+                                       num_workers=dataset_config.num_workers)
 
-    train_dataloader_lm = torch.utils.data.DataLoader(dataset_lm, batch_size=config.training.batch_size_lm,
-                                                      sampler=None, collate_fn=dataset_lm.collate_fn,
-                                                      num_workers=dataset_config.num_workers)
+        train_dataloader_lm = torch.utils.data.DataLoader(dataset_lm, batch_size=config.training.batch_size_lm,
+                                                          sampler=None, collate_fn=dataset_lm.collate_fn,
+                                                          num_workers=dataset_config.num_workers)
+    else:
+        train_dataloader_lm = None
 
     # Combine these dataloaders into a single iterable model
-    iterables = {
-        "t2i_flow": train_dataloader_t2i,
-        "lm_flow": train_dataloader_lm,
-        "mmu_flow": train_dataloader_mmu,
-    }
+    iterables = {}
+    if enable_t2i:
+        iterables["t2i_flow"] = train_dataloader_t2i
+    if enable_lm:
+        iterables["lm_flow"] = train_dataloader_lm
+    if enable_mmu:
+        iterables["mmu_flow"] = train_dataloader_mmu
     if navsim_enabled:
         iterables["navsim_flow"] = navsim_loader
 
+    if not iterables:
+        raise ValueError("No data flows enabled. Enable at least one of T2I, LM, MMU, or NavSim.")
+
     combined_dataloader = CombinedLoader(iterables, mode=config.dataset.combined_loader_mode)
+
+    if num_update_steps_per_epoch is None or num_train_epochs is None:
+        if navsim_enabled and navsim_loader is not None:
+            navsim_batches = len(navsim_loader) if hasattr(navsim_loader, "__len__") else config.training.max_train_steps
+            steps_per_epoch = max(1, math.ceil(navsim_batches / max(1, config.training.gradient_accumulation_steps)))
+        else:
+            # fallback to the first available iterable length
+            first_loader = next(iter(iterables.values()))
+            loader_len = len(first_loader) if hasattr(first_loader, "__len__") else config.training.max_train_steps
+            steps_per_epoch = max(1, math.ceil(loader_len / max(1, config.training.gradient_accumulation_steps)))
+        num_update_steps_per_epoch = steps_per_epoch
+        num_train_epochs = math.ceil(config.training.max_train_steps / num_update_steps_per_epoch)
 
     ##################################
     #         MODEL RESUME          #
@@ -470,6 +519,11 @@ def main():
                 raise FileNotFoundError(f"Checkpoint {path}/unwrapped_model/pytorch_model.bin not found")
     else:
         logger.info("Not resuming from checkpoint")
+
+    navsim_only_mode = navsim_enabled and not (enable_t2i or enable_lm or enable_mmu)
+    if navsim_only_mode:
+        run_navsim_only_training(num_train_epochs)
+        return
 
     ##################################
     #       Prepare accelerator     #
@@ -595,6 +649,101 @@ def main():
         answer_lengths = answer_lengths.repeat(1, noisy_batch.shape[1])    
 
         return noisy_batch, labels_mmu, p_mask, answer_lengths
+
+
+    def run_navsim_only_training(num_train_epochs_local):
+        nonlocal global_step, first_epoch
+
+        logger.info("Running NavSim-only training loop.")
+        batch_time_m = AverageMeter()
+        data_time_m = AverageMeter()
+        end_local = time.time()
+
+        for epoch in range(first_epoch, num_train_epochs_local):
+            model.train()
+            for navsim_batch in navsim_loader:
+                data_time_m.update(time.time() - end_local)
+                input_ids_navsim, labels_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
+                batch_size_navsim = input_ids_navsim.shape[0]
+
+                with accelerator.accumulate(model):
+                    logits, loss_t2i, loss_lm, loss_mmu, loss_navsim = model.forward_process(
+                        input_ids=input_ids_navsim,
+                        labels=labels_navsim,
+                        batch_size_t2i=0,
+                        batch_size_lm=0,
+                        batch_size_mmu=0,
+                        batch_size_navsim=batch_size_navsim,
+                        max_seq_length=config.dataset.preprocessing.max_seq_length,
+                        p_mask_lm=None,
+                        p_mask_mmu=None,
+                        answer_lengths=None,
+                        t2i_masks=None,
+                    )
+                    loss = navsim_coeff * loss_navsim
+                    accelerator.backward(loss)
+
+                    if config.training.max_grad_norm is not None and accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
+
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                if accelerator.sync_gradients:
+                    batch_time_m.update(time.time() - end_local)
+                    end_local = time.time()
+
+                    avg_loss_navsim = accelerator.gather(
+                        loss_navsim.repeat(max(1, batch_size_navsim))
+                    ).mean()
+                    if (global_step + 1) % config.experiment.log_every == 0:
+                        samples_per_second_per_gpu = (
+                            config.training.gradient_accumulation_steps
+                            * max(1, config.training.batch_size_navsim)
+                            / max(batch_time_m.val, 1e-8)
+                        )
+                        logs = {
+                            "step_loss_navsim": avg_loss_navsim.item(),
+                            "lr": lr_scheduler.get_last_lr()[0],
+                            "samples/sec/gpu": samples_per_second_per_gpu,
+                            "data_time": data_time_m.val,
+                            "batch_time": batch_time_m.val,
+                        }
+                        accelerator.log(logs, step=global_step + 1)
+                        logger.info(
+                            f"Step: {global_step + 1} "
+                            f"Loss_navsim: {avg_loss_navsim.item():0.4f} "
+                            f"Data (t): {data_time_m.val:0.4f}, {samples_per_second_per_gpu:0.2f}/s/gpu "
+                            f"Batch (t): {batch_time_m.val:0.4f} "
+                            f"LR: {lr_scheduler.get_last_lr()[0]:0.6f}"
+                        )
+                        batch_time_m.reset()
+                        data_time_m.reset()
+
+                    if (
+                        accelerator.sync_gradients
+                        and (global_step + 1) % config.experiment.log_grad_norm_every == 0
+                        and accelerator.is_main_process
+                    ):
+                        log_grad_norm(model, accelerator, global_step + 1)
+
+                    if (global_step + 1) % config.experiment.save_every == 0:
+                        save_checkpoint(model, config, accelerator, global_step + 1)
+
+                global_step += 1
+                if global_step >= config.training.max_train_steps:
+                    break
+
+            if global_step >= config.training.max_train_steps:
+                break
+
+        accelerator.wait_for_everyone()
+        save_checkpoint(model, config, accelerator, global_step)
+        if accelerator.is_main_process:
+            model_to_save = accelerator.unwrap_model(model)
+            model_to_save.save_pretrained(config.experiment.output_dir, safe_serialization=True)
+        accelerator.end_training()
 
 
 
