@@ -55,6 +55,17 @@ dataset:
         resolution: 256
         pin_memory: True
         persistent_workers: True
+        navsim:
+            enabled: False
+            json_path: ""
+            navsim_log_path: ""
+            sensor_blobs_path: ""
+            num_history_frames: 4
+            num_future_frames: 8
+            target_future_seconds: 4.0
+            num_workers: 4
+            shuffle: True
+            drop_last: False
 
     preprocessing:
         max_seq_length: 128 # for text tokens
@@ -84,6 +95,7 @@ training:
     batch_size_t2i: 7
     batch_size_lm: 2
     batch_size_mmu: 6
+    batch_size_navsim: 0
     mixed_precision: "bf16"
     enable_tf32: True
     seed: 10086
@@ -98,3 +110,4 @@ training:
     t2i_coeff: 1.0
     lm_coeff: 0.1
     mmu_coeff: 1.0
+    navsim_coeff: 1.0

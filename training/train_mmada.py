@@ -41,6 +41,9 @@ from training.utils import get_config, flatten_omega_conf, image_transform
 from training.imagenet_dataset import ImageNetDataset
 from parquet import RefinedWebDataset
 
+from training.navsim.navsim_mmada_dataset import create_navsim_mmada_dataloader
+from training.navsim.action_tokens import action_token_vocab
+
 from models import MAGVITv2, get_mask_schedule, MMadaModelLM, MMadaConfig
 from training.prompting_utils import UniversalPrompting
 from models.lr_schedulers import get_scheduler
@@ -94,11 +97,14 @@ def main():
         split_batches=True,
     )
 
+    batch_size_navsim_cfg = getattr(config.training, "batch_size_navsim", 0)
+    navsim_coeff = getattr(config.training, "navsim_coeff", 0.0)
     total_batch_size_per_gpu = (config.training.batch_size_t2i
                                 + config.training.batch_size_lm
-                                + config.training.batch_size_mmu)
+                                + config.training.batch_size_mmu
+                                + batch_size_navsim_cfg)
     total_batch_size = (
-            (config.training.batch_size_t2i + config.training.batch_size_lm + config.training.batch_size_mmu)
+            (config.training.batch_size_t2i + config.training.batch_size_lm + config.training.batch_size_mmu + batch_size_navsim_cfg)
             * accelerator.num_processes * config.training.gradient_accumulation_steps
     )
 
@@ -174,6 +180,16 @@ def main():
 
     print('special tokens : \n', uni_prompting.sptids_dict)
 
+    navsim_special_tokens = [
+        "<|navsim|>",
+        "<nav_hist_sep>",
+        "<nav_action_sep>",
+        "<nav_future_sep>",
+    ]
+    navsim_token_list = navsim_special_tokens + action_token_vocab()
+    uni_prompting.register_tokens(navsim_token_list)
+    tokenizer_vocab_size = len(tokenizer)
+
     # VQ model for processing image into discrete tokens
     vq_model = get_vq_model_class(config.model.vq_model.type)
     if config.model.vq_model.get("pretrained_model_path", None):
@@ -190,8 +206,13 @@ def main():
     mmada_config_dict = {k: v for k, v in config.model.mmada.items()}
     merged_config = {**base_config, **mmada_config_dict}
     mmada_config = MMadaConfig(**merged_config)
+    llm_vocab_size = tokenizer_vocab_size
+    total_vocab_size = llm_vocab_size + mmada_config.codebook_size
+    mmada_config.llm_vocab_size = llm_vocab_size
+    mmada_config.vocab_size = total_vocab_size
+    mmada_config.new_vocab_size = total_vocab_size
     model = MMadaModelLM.from_pretrained(config.model.mmada.pretrained_model_path, torch_dtype=torch.bfloat16, config=mmada_config)
-    model.resize_token_embeddings(mmada_config.new_vocab_size)
+    model.resize_token_embeddings(total_vocab_size)
     model.config.embedding_size = model.config.vocab_size
     model = model.to(accelerator.device)
 
@@ -261,6 +282,8 @@ def main():
     # This means that the dataloading is not deterministic, but it's fast and efficient.
     preproc_config = config.dataset.preprocessing
     dataset_config = config.dataset.params
+    navsim_cfg = dataset_config.get("navsim", None) if hasattr(dataset_config, "get") else None
+    navsim_enabled = bool(navsim_cfg and navsim_cfg.get("enabled", False))
 
     # Data for generation
     if config.dataset.gen_type == "t2i":
@@ -374,6 +397,24 @@ def main():
     else:
         raise NotImplementedError(f"Unsupported dataset type {config.dataset.und_type}")
 
+    navsim_loader = None
+    if navsim_enabled:
+        navsim_params = OmegaConf.to_container(navsim_cfg, resolve=True)
+        navsim_loader = create_navsim_mmada_dataloader(
+            json_path=navsim_params["json_path"],
+            navsim_log_path=navsim_params["navsim_log_path"],
+            sensor_blobs_path=navsim_params["sensor_blobs_path"],
+            batch_size=config.training.batch_size_navsim,
+            num_workers=navsim_params.get("num_workers", dataset_config.num_workers),
+            shuffle=navsim_params.get("shuffle", True),
+            pin_memory=dataset_config.pin_memory,
+            persistent_workers=dataset_config.persistent_workers,
+            drop_last=navsim_params.get("drop_last", False),
+            num_history_frames=navsim_params.get("num_history_frames", 4),
+            num_future_frames=navsim_params.get("num_future_frames", 8),
+            target_future_seconds=navsim_params.get("target_future_seconds", 4.0),
+        )
+
     # LLM pure text dataset: RefinedWeb
     dataset_lm = RefinedWebDataset(data_path=dataset_config.train_lm_shards_path_or_url,
                                    rank=accelerator.process_index,
@@ -390,6 +431,8 @@ def main():
         "lm_flow": train_dataloader_lm,
         "mmu_flow": train_dataloader_mmu,
     }
+    if navsim_enabled:
+        iterables["navsim_flow"] = navsim_loader
 
     combined_dataloader = CombinedLoader(iterables, mode=config.dataset.combined_loader_mode)
 
@@ -493,6 +536,50 @@ def main():
         return noisy_batch, labels_lm, p_mask
     
     @torch.no_grad()
+    def prepare_inputs_and_labels_for_navsim(navsim_batch):
+        history_front = navsim_batch["history_front_images"].to(accelerator.device, non_blocking=True)
+        bsz, num_hist, channels, height, width = history_front.shape
+        history_flat = history_front.reshape(bsz * num_hist, channels, height, width)
+        token_offset = len(uni_prompting.text_tokenizer)
+
+        history_codes = vq_model.get_code(history_flat).long() + token_offset
+        history_codes = history_codes.view(bsz, num_hist, -1)
+
+        hist_sep_token = uni_prompting.sptids_dict['<nav_hist_sep>'].to(accelerator.device).long().view(1)
+        history_sequences = []
+        for i in range(bsz):
+            pieces = []
+            for t in range(num_hist):
+                pieces.append(history_codes[i, t])
+                if t < num_hist - 1:
+                    pieces.append(hist_sep_token)
+            history_sequences.append(torch.cat(pieces, dim=0))
+        max_history_len = max(seq.shape[0] for seq in history_sequences)
+        pad_value = torch.tensor([uni_prompting.pad_id], device=accelerator.device, dtype=torch.long)
+        history_tensor = []
+        for seq in history_sequences:
+            if seq.shape[0] < max_history_len:
+                pad = pad_value.repeat(max_history_len - seq.shape[0])
+                seq = torch.cat((pad, seq), dim=0)
+            history_tensor.append(seq)
+        history_tensor = torch.stack(history_tensor, dim=0)
+
+        future_front = navsim_batch["future_front_image"].to(accelerator.device, non_blocking=True)
+        future_tokens = vq_model.get_code(future_front).long() + token_offset
+
+        action_token_ids = []
+        for tokens in navsim_batch["action_tokens"]:
+            ids = [uni_prompting.text_tokenizer.convert_tokens_to_ids(token) for token in tokens]
+            action_token_ids.append(torch.tensor(ids, dtype=torch.long, device=accelerator.device))
+        action_token_tensor = torch.stack(action_token_ids, dim=0)
+
+        input_ids_navsim, _, labels_navsim = uni_prompting(
+            (history_tensor.long(), navsim_batch["prompt_text"], action_token_tensor, future_tokens.long()),
+            'navsim'
+        )
+        return input_ids_navsim, labels_navsim
+
+    @torch.no_grad()
     def prepare_inputs_and_labels_for_mmu(
         input_ids_mmu, prompt_masks, labels_mmu, eps=1e-3
     ):
@@ -527,6 +614,7 @@ def main():
             batch_size_t2i = batch["t2i_flow"]["images"].shape[0]
             batch_size_lm = len(batch["lm_flow"]["input_ids"])
             batch_size_mmu = batch["mmu_flow"]["images"].shape[0]
+            batch_size_navsim = 0
 
             # *-------*-------*-------*-------*-------*-------*-------*-------*-------*-------*-------*
             # Build formatted sequences for class-conditional/text-to-image generation
@@ -605,18 +693,26 @@ def main():
 
             input_ids = torch.cat((input_ids, input_ids_mmu.to(input_ids.device)), dim=0)
             labels = torch.cat((labels, labels_mmu.to(input_ids.device)), dim=0)
+
+            if navsim_enabled:
+                navsim_batch = batch["navsim_flow"]
+                input_ids_navsim, labels_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
+                batch_size_navsim = input_ids_navsim.shape[0]
+                input_ids = torch.cat((input_ids, input_ids_navsim.to(input_ids.device)), dim=0)
+                labels = torch.cat((labels, labels_navsim.to(input_ids.device)), dim=0)
             
             if global_step == 0 and epoch == 0:
                 logger.info("Input ids: {}".format(input_ids))
                 logger.info("Labels: {}".format(labels))
 
             with accelerator.accumulate(model):
-                logits, loss_t2i, loss_lm, loss_mmu = model.forward_process(
+                logits, loss_t2i, loss_lm, loss_mmu, loss_navsim = model.forward_process(
                     input_ids=input_ids,
                     labels=labels,
                     batch_size_t2i=batch_size_t2i,
                     batch_size_lm=batch_size_lm,
                     batch_size_mmu=batch_size_mmu,
+                    batch_size_navsim=batch_size_navsim,
                     max_seq_length=config.dataset.preprocessing.max_seq_length,
                     p_mask_lm=p_mask_lm,
                     p_mask_mmu=p_mask_mmu,  
@@ -627,9 +723,14 @@ def main():
                 avg_loss_t2i = accelerator.gather(loss_t2i.repeat(config.training.batch_size_t2i)).mean()
                 avg_loss_lm = accelerator.gather(loss_lm.repeat(config.training.batch_size_lm)).mean()
                 avg_loss_mmu = accelerator.gather(loss_mmu.repeat(config.training.batch_size_mmu)).mean()
+                if batch_size_navsim > 0:
+                    avg_loss_navsim = accelerator.gather(loss_navsim.repeat(batch_size_navsim)).mean()
+                else:
+                    avg_loss_navsim = torch.tensor(0.0, device=accelerator.device)
                 loss = config.training.t2i_coeff * loss_t2i + \
                        config.training.lm_coeff * loss_lm + \
-                       config.training.mmu_coeff * loss_mmu
+                       config.training.mmu_coeff * loss_mmu + \
+                       navsim_coeff * loss_navsim
 
                 avg_masking_rate = accelerator.gather(mask_prob.repeat(config.training.batch_size_t2i)).mean()
 
@@ -666,6 +767,7 @@ def main():
                         "step_loss_t2i": avg_loss_t2i.item(),
                         "step_loss_mmu": avg_loss_mmu.item(),
                         "step_loss_lm": avg_loss_lm.item(),
+                        "step_loss_navsim": avg_loss_navsim.item(),
                         "lr": lr_scheduler.get_last_lr()[0],
                         "avg_masking_rate": avg_masking_rate.item(),
                         "samples/sec/gpu": samples_per_second_per_gpu,
@@ -679,6 +781,7 @@ def main():
                         f"Loss_t2i: {avg_loss_t2i.item():0.4f} "
                         f"Loss_mmu: {avg_loss_mmu.item():0.4f} "
                         f"Loss_lm: {avg_loss_lm.item():0.4f} "
+                        f"Loss_navsim: {avg_loss_navsim.item():0.4f} "
                         f"Data (t): {data_time_m.val:0.4f}, {samples_per_second_per_gpu:0.2f}/s/gpu "
                         f"Batch (t): {batch_time_m.val:0.4f} "
                         f"LR: {lr_scheduler.get_last_lr()[0]:0.6f}"

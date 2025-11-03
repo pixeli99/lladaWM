@@ -632,7 +632,7 @@ def main():
                 logger.info("Labels: {}".format(labels))
 
             with accelerator.accumulate(model):
-                logits, loss_t2i, loss_lm, loss_mmu = model.forward_process(
+                logits, loss_t2i, loss_lm, loss_mmu, _ = model.forward_process(
                     input_ids=input_ids,
                     labels=labels,
                     batch_size_t2i=batch_size_t2i,

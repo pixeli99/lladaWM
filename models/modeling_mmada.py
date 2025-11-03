@@ -212,11 +212,12 @@ class MMadaModelLM(LLaDAModelLM):
     
     def forward_process(
             self,
-            input_ids, 
+            input_ids,
             labels,
             batch_size_t2i=0,
             batch_size_lm=0,
             batch_size_mmu=0,
+            batch_size_navsim=0,
             max_seq_length=128,
             p_mask_lm=None,
             p_mask_mmu=None,
@@ -239,29 +240,46 @@ class MMadaModelLM(LLaDAModelLM):
                 labels[:batch_size_t2i, max_seq_length + 1:].contiguous().view(-1), ignore_index=-100,
                 )
         
+        start_lm = batch_size_t2i
+        end_lm = start_lm + batch_size_lm
+        start_mmu = end_lm
+        end_mmu = start_mmu + batch_size_mmu
+        start_navsim = end_mmu
+        end_navsim = start_navsim + batch_size_navsim
+
         masked_indices = input_ids == self.config.mask_token_id 
-        masked_indices_lm = masked_indices[batch_size_t2i:batch_size_t2i + batch_size_lm]
-        masked_indices_mmu = masked_indices[-batch_size_mmu:]
+        masked_indices_lm = masked_indices[start_lm:end_lm]
+        masked_indices_mmu = masked_indices[start_mmu:end_mmu]
         p_mask_lm = p_mask_lm.to(masked_indices_lm.device)
         p_mask_mmu = p_mask_mmu.to(masked_indices_mmu.device)       
         answer_lengths = answer_lengths.to(masked_indices_mmu.device) 
         loss_lm = F.cross_entropy(
-            logits[batch_size_t2i:batch_size_t2i + batch_size_lm][masked_indices_lm].contiguous().view(-1, self.output_size),
-            labels[batch_size_t2i:batch_size_t2i + batch_size_lm][masked_indices_lm].contiguous().view(-1), ignore_index=-100, reduction='none'
+            logits[start_lm:end_lm][masked_indices_lm].contiguous().view(-1, self.output_size),
+            labels[start_lm:end_lm][masked_indices_lm].contiguous().view(-1), ignore_index=-100, reduction='none'
             )/p_mask_lm[masked_indices_lm]
 
         if answer_lengths_lm is not None:
-            loss_lm = torch.sum(loss_lm / answer_lengths_lm[masked_indices_lm]) / (logits[batch_size_t2i:batch_size_t2i + batch_size_lm].shape[0])  
+            loss_lm = torch.sum(loss_lm / answer_lengths_lm[masked_indices_lm]) / (logits[start_lm:end_lm].shape[0])  
         else:
-            loss_lm = loss_lm.sum() / (logits[batch_size_t2i:batch_size_t2i + batch_size_lm].shape[0] * logits[batch_size_t2i:batch_size_t2i + batch_size_lm].shape[1])     
+            loss_lm = loss_lm.sum() / (logits[start_lm:end_lm].shape[0] * logits[start_lm:end_lm].shape[1])     
 
-        loss_mmu = F.cross_entropy(
-            logits[-batch_size_mmu:][masked_indices_mmu].contiguous().view(-1, self.output_size),
-            labels[-batch_size_mmu:][masked_indices_mmu].contiguous().view(-1), ignore_index=-100, reduction='none'
-            )/p_mask_mmu[masked_indices_mmu]
-        loss_mmu = torch.sum(loss_mmu/answer_lengths[masked_indices_mmu]) / (logits[-batch_size_mmu:].shape[0])
+        if batch_size_mmu == 0:
+            loss_mmu = torch.tensor(0.0, device=input_ids.device)
+        else:
+            loss_mmu = F.cross_entropy(
+                logits[start_mmu:end_mmu][masked_indices_mmu].contiguous().view(-1, self.output_size),
+                labels[start_mmu:end_mmu][masked_indices_mmu].contiguous().view(-1), ignore_index=-100, reduction='none'
+                )/p_mask_mmu[masked_indices_mmu]
+            loss_mmu = torch.sum(loss_mmu/answer_lengths[masked_indices_mmu]) / (logits[start_mmu:end_mmu].shape[0])
+
+        if batch_size_navsim == 0:
+            loss_navsim = torch.tensor(0.0, device=input_ids.device)
+        else:
+            navsim_logits = logits[start_navsim:end_navsim].reshape(-1, self.output_size)
+            navsim_labels = labels[start_navsim:end_navsim].reshape(-1)
+            loss_navsim = F.cross_entropy(navsim_logits, navsim_labels, ignore_index=-100)
         
-        return logits, loss_t2i, loss_lm, loss_mmu
+        return logits, loss_t2i, loss_lm, loss_mmu, loss_navsim
 
     def forward_process_with_r2i(
             self,

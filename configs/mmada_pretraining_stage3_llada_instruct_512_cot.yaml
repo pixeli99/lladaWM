@@ -72,6 +72,17 @@ dataset:
         resolution: 512
         pin_memory: True
         persistent_workers: True
+        navsim:
+            enabled: False
+            json_path: ""
+            navsim_log_path: ""
+            sensor_blobs_path: ""
+            num_history_frames: 4
+            num_future_frames: 8
+            target_future_seconds: 4.0
+            num_workers: 4
+            shuffle: True
+            drop_last: False
 
     preprocessing:
         max_seq_length: 512 # for text tokens in t2i & mmu
@@ -103,6 +114,7 @@ training:
     batch_size_t2i: 1
     batch_size_lm: 2
     batch_size_mmu: 1
+    batch_size_navsim: 0
     mixed_precision: "bf16"
     enable_tf32: True
     seed: 10086
@@ -117,6 +129,7 @@ training:
     t2i_coeff: 1.0
     lm_coeff: 0.5
     mmu_coeff: 0.5
+    navsim_coeff: 1.0
 
 validation:
     quantative_prompts_file: "/data_storage/ty/MMaDA/validation_prompts/quantative.txt" 

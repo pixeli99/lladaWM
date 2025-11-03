@@ -30,6 +30,7 @@ reserved_token_mapping = {
 
 
 import torch
+from typing import Sequence
 class UniversalPrompting():
     def __init__(self, text_tokenizer,
                  special_tokens=("<|soi|>", "<|eoi|>", "<|sov|>", "<|eov|>", "<|t2i|>", "<|mmu|>", "<|t2v|>", "<|v2v|>", "<|lvg|>"),
@@ -77,6 +78,26 @@ class UniversalPrompting():
         self.pad_id = reserved_token_mapping['[iPAD]']
         self.ignore_id = ignore_id
         self.cond_dropout_prob = cond_dropout_prob
+
+    def register_tokens(self, tokens: Sequence[str]):
+        """Add custom tokens to tokenizer and cache their ids."""
+        if not tokens:
+            return
+        new_tokens = []
+        for token in tokens:
+            token_id = self.text_tokenizer.convert_tokens_to_ids(token)
+            if token_id == self.text_tokenizer.unk_token_id:
+                new_tokens.append(token)
+        if new_tokens:
+            added = self.text_tokenizer.add_tokens(list(new_tokens))
+            if added != len(new_tokens):
+                print(
+                    f"[UniversalPrompting] Warning: requested {len(new_tokens)} new tokens "
+                    f"but tokenizer added {added}."
+                )
+        for token in tokens:
+            token_id = self.text_tokenizer.convert_tokens_to_ids(token)
+            self.sptids_dict[token] = torch.tensor([token_id])
 
     def t2i_prompt(self, text_ids, image_ids, labels):
 
@@ -411,6 +432,66 @@ class UniversalPrompting():
         
     
 
+    def navsim_prompt(self, history_image_ids, text_ids, action_token_ids, future_image_ids):
+        device = history_image_ids.device
+        sequence_ids = []
+        prompt_masks = []
+        label_ids = []
+        max_text_len = self.max_text_len - 1
+
+        for i in range(len(text_ids)):
+            tokens = text_ids[i]
+            if len(tokens) == 0:
+                tokens = [self.text_tokenizer.bos_token_id]
+            elif tokens[0] != self.text_tokenizer.bos_token_id:
+                tokens = [self.text_tokenizer.bos_token_id] + tokens
+            tokens = tokens + [self.text_tokenizer.eos_token_id]
+
+            if max_text_len >= len(tokens):
+                tokens = tokens + [self.text_tokenizer.eos_token_id] * (max_text_len - len(tokens))
+            else:
+                tokens = tokens[:max_text_len - 1] + [self.text_tokenizer.eos_token_id]
+
+            text_tensor = torch.tensor(tokens, device=device)
+            history_tokens = history_image_ids[i].to(device)
+            action_tokens = action_token_ids[i].to(device)
+            future_tokens = future_image_ids[i].to(device)
+
+            seq = torch.cat([
+                self.sptids_dict['<|navsim|>'].to(device),
+                self.sptids_dict['<|soi|>'].to(device),
+                history_tokens,
+                self.sptids_dict['<|eoi|>'].to(device),
+                text_tensor,
+                self.sptids_dict['<nav_action_sep>'].to(device),
+                action_tokens,
+                self.sptids_dict['<nav_future_sep>'].to(device),
+                self.sptids_dict['<|soi|>'].to(device),
+                future_tokens,
+                self.sptids_dict['<|eoi|>'].to(device),
+            ], dim=0)
+
+            prefix_length = (
+                1  # <|navsim|>
+                + 1  # <|soi|>
+                + history_tokens.shape[0]
+                + 1  # <|eoi|>
+                + text_tensor.shape[0]
+                + 1  # <nav_action_sep>
+            )
+
+            prompt_mask = torch.ones(seq.shape[0], device=device, dtype=torch.long)
+            prompt_mask[prefix_length:] = 0
+
+            label = seq.clone()
+            label[:prefix_length] = self.ignore_id
+
+            sequence_ids.append(seq.unsqueeze(0))
+            prompt_masks.append(prompt_mask.unsqueeze(0))
+            label_ids.append(label.unsqueeze(0))
+
+        return torch.cat(sequence_ids, dim=0), torch.cat(prompt_masks, dim=0), torch.cat(label_ids, dim=0)
+
     def mask_prompt(self):
         pass
 
@@ -459,6 +540,13 @@ class UniversalPrompting():
             image_ids = input[0]
             text_ids = self.text_tokenizer(input[1])['input_ids']
             sequence_ids_with_masks = self.mmu_prompt(image_ids, text_ids)
+
+        elif task == "navsim":
+            history_image_ids = input[0]
+            text_ids = self.text_tokenizer(input[1], truncation=True)['input_ids']
+            action_token_ids = input[2]
+            future_image_ids = input[3]
+            sequence_ids_with_masks = self.navsim_prompt(history_image_ids, text_ids, action_token_ids, future_image_ids)
         
         elif task == "r2i":
             image_ids = input[0]

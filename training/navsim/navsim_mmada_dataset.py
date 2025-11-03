@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+from .action_tokens import status_to_bev_tokens
+from .navsim_online_dataset import NavsimOnlineDataset
+
+
+@dataclass
+class NavsimSampleTransforms:
+    include_stitched: bool = True
+    include_front: bool = True
+
+
+def _format_velocity(vec: torch.Tensor) -> str:
+    vx, vy = float(vec[0].item()), float(vec[1].item())
+    speed = math.sqrt(vx ** 2 + vy ** 2)
+    heading_deg = math.degrees(math.atan2(vy, vx))
+    return f"speed={speed:.2f} m/s, heading={heading_deg:.1f} deg"
+
+
+def _format_point(x: float, y: float) -> str:
+    return f"({x:.2f}, {y:.2f})"
+
+
+def _format_trajectory(traj: torch.Tensor) -> str:
+    # traj shape: [T, 3] (x, y, heading)
+    coords = [_format_point(float(p[0].item()), float(p[1].item())) for p in traj]
+    return "[" + ", ".join(coords) + "]"
+
+
+class NavsimMMaDADataset(Dataset):
+    """Wrap NavSim stream to expose history context + discrete action tokens for MMaDA training."""
+
+    def __init__(
+        self,
+        *,
+        json_path: str,
+        navsim_log_path: str,
+        sensor_blobs_path: str,
+        transforms: Optional[NavsimSampleTransforms] = None,
+        num_history_frames: int = 4,
+        num_future_frames: int = 8,
+        target_future_seconds: float = 4.0,
+    ) -> None:
+        super().__init__()
+        tfm = transforms or NavsimSampleTransforms()
+        self.dataset = NavsimOnlineDataset(
+            json_path=json_path,
+            navsim_log_path=navsim_log_path,
+            sensor_blobs_path=sensor_blobs_path,
+            include_front=tfm.include_front,
+            include_stitched=tfm.include_stitched,
+            num_history_frames=num_history_frames,
+            num_future_frames=num_future_frames,
+            target_future_seconds=target_future_seconds,
+        )
+        self.target_future_seconds = target_future_seconds
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def _build_prompt(self, sample: Dict[str, Any]) -> str:
+        history_status: torch.Tensor = sample["history_status"]
+        history_traj: torch.Tensor = sample["history_trajectory"]
+        history_times: torch.Tensor = sample["history_timestamps"]
+        num_frames = history_status.shape[0]
+
+        last_status = history_status[-1]
+        command_vec = last_status[:4]
+        velocity = last_status[4:6]
+        acceleration = last_status[6:8]
+
+        dt = float(self.target_future_seconds)
+        prompt = [
+            f"The ego vehicle history spans {num_frames} frames. Predict the driving action and front camera view after {dt:.2f} seconds.",
+            f"Current velocity: {_format_velocity(velocity)}.",
+            f"Current acceleration: ax={float(acceleration[0].item()):.2f} m/s^2, ay={float(acceleration[1].item()):.2f} m/s^2.",
+        ]
+
+        directions = ["go left", "go straight", "go right", "unknown"]
+        dir_idx = int(torch.argmax(command_vec).item())
+        dir_text = directions[max(0, min(len(directions) - 1, dir_idx))]
+        prompt.append(f"You plan to take the following action: {dir_text}.")
+
+        # Include sampled trajectory summary
+        prompt.append(f"Recent trajectory (ego frame): {_format_trajectory(history_traj)}.")
+
+        timestamps = ", ".join(str(int(ts.item())) for ts in history_times)
+        prompt.append(f"History timestamps (ns): [{timestamps}].")
+
+        meta = sample["metadata"]
+        prompt.append(f"Log={meta['log_name']} Scene={meta['scene_token']} Map={meta['map_name']}.")
+
+        return " ".join(prompt)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.dataset[idx]
+        future_status: torch.Tensor = sample["future_status"]
+        action_tokens = status_to_bev_tokens(future_status)
+
+        record: Dict[str, Any] = {
+            "history_front_images": sample.get("history_front_images"),
+            "history_stitched_images": sample.get("history_stitched_images"),
+            "history_status": sample["history_status"],
+            "history_trajectory": sample["history_trajectory"],
+            "history_timestamps": sample["history_timestamps"],
+            "future_front_image": sample.get("future_front_image"),
+            "action_tokens": action_tokens,
+            "prompt_text": self._build_prompt(sample),
+            "target_future_seconds": torch.tensor(self.target_future_seconds, dtype=torch.float32),
+            "metadata": sample["metadata"],
+        }
+        return record
+
+
+def create_navsim_mmada_dataloader(
+    *,
+    json_path: str,
+    navsim_log_path: str,
+    sensor_blobs_path: str,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool = True,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+    drop_last: bool = False,
+    **dataset_kwargs: Any,
+) -> DataLoader:
+    dataset = NavsimMMaDADataset(
+        json_path=json_path,
+        navsim_log_path=navsim_log_path,
+        sensor_blobs_path=sensor_blobs_path,
+        **dataset_kwargs,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        drop_last=drop_last,
+    )
