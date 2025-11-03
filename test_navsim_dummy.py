@@ -9,7 +9,7 @@ import torch
 from transformers import AutoTokenizer
 
 from training.prompting_utils import UniversalPrompting
-from training.navsim.action_tokens import action_token_vocab, status_to_bev_tokens
+from training.navsim_data.action_tokens import action_token_vocab, status_to_bev_tokens
 
 
 def _make_status_samples() -> torch.Tensor:

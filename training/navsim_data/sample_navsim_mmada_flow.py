@@ -6,7 +6,7 @@ import pprint
 
 import torch
 
-from training.navsim.navsim_mmada_dataset import create_navsim_mmada_dataloader
+from training.navsim_data.navsim_mmada_dataset import create_navsim_mmada_dataloader
 
 
 def parse_args() -> argparse.Namespace:

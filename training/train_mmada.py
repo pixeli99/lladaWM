@@ -41,8 +41,8 @@ from training.utils import get_config, flatten_omega_conf, image_transform
 from training.imagenet_dataset import ImageNetDataset
 from parquet import RefinedWebDataset
 
-from training.navsim.navsim_mmada_dataset import create_navsim_mmada_dataloader
-from training.navsim.action_tokens import action_token_vocab
+from training.navsim_data.navsim_mmada_dataset import create_navsim_mmada_dataloader
+from training.navsim_data.action_tokens import action_token_vocab
 
 from models import MAGVITv2, get_mask_schedule, MMadaModelLM, MMadaConfig
 from training.prompting_utils import UniversalPrompting
