@@ -180,7 +180,13 @@ def main():
 
     print('special tokens : \n', uni_prompting.sptids_dict)
 
-    navsim_token_list = action_token_vocab()
+    navsim_special_tokens = [
+        "<|navsim|>",
+        "<nav_hist_sep>",
+        "<nav_action_sep>",
+        "<nav_future_sep>",
+    ]
+    navsim_token_list = navsim_special_tokens + action_token_vocab()
     uni_prompting.register_tokens(navsim_token_list)
     tokenizer_vocab_size = len(tokenizer)
 
