@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from .action_tokens import status_to_bev_tokens
+from .action_tokens import status_to_bev_tokens, trajectory_to_bev_tokens
 from .navsim_online_dataset import NavsimOnlineDataset
 
 
@@ -91,18 +91,12 @@ class NavsimMMaDADataset(Dataset):
         # Include sampled trajectory summary
         prompt.append(f"Recent trajectory (ego frame): {_format_trajectory(history_traj)}.")
 
-        timestamps = ", ".join(str(int(ts.item())) for ts in history_times)
-        prompt.append(f"History timestamps (ns): [{timestamps}].")
-
-        meta = sample["metadata"]
-        prompt.append(f"Log={meta['log_name']} Scene={meta['scene_token']} Map={meta['map_name']}.")
-
         return " ".join(prompt)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.dataset[idx]
-        future_status: torch.Tensor = sample["future_status"]
-        action_tokens = status_to_bev_tokens(future_status)
+        future_trajectory: torch.Tensor = sample["future_trajectory"]  # Shape: [T, 3] (x, y, heading)
+        action_tokens = trajectory_to_bev_tokens(future_trajectory)
 
         record: Dict[str, Any] = {
             "history_front_images": sample.get("history_front_images"),

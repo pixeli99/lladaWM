@@ -60,6 +60,27 @@ def status_to_bev_tokens(status: Union[torch.Tensor, Sequence[float], np.ndarray
     return velocity_to_bev_tokens(velocity) + acceleration_to_bev_tokens(acceleration)
 
 
+def trajectory_to_bev_tokens(trajectory: Union[torch.Tensor, np.ndarray]) -> List[str]:
+    """
+    Convert trajectory waypoints to BEV tokens.
+    :param trajectory: trajectory tensor of shape [T, 3] or [T, 2+] where first 2 dims are (x, y)
+    :return: list of BEV tokens for each waypoint [x0, y0, x1, y1, ...]
+    """
+    if isinstance(trajectory, torch.Tensor):
+        traj_np = trajectory.detach().cpu().numpy()
+    else:
+        traj_np = np.asarray(trajectory)
+    
+    # Extract x, y coordinates from trajectory (shape: [T, 3] or [T, 2+])
+    tokens = []
+    for waypoint in traj_np:
+        x, y = float(waypoint[0]), float(waypoint[1])
+        tokens.append(_value_to_bev_token(x))
+        tokens.append(_value_to_bev_token(y))
+    
+    return tokens
+
+
 def action_token_vocab() -> List[str]:
     """Return BEV token vocabulary used for action regression."""
     return bev_tokens()
