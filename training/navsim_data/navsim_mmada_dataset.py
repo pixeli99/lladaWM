@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -47,6 +47,8 @@ class NavsimMMaDADataset(Dataset):
         num_history_frames: int = 4,
         num_future_frames: int = 8,
         target_future_seconds: float = 4.0,
+        stitched_image_size: Tuple[int, int] = (1024, 256),
+        front_image_size: Tuple[int, int] = (256, 128),
     ) -> None:
         super().__init__()
         tfm = transforms or NavsimSampleTransforms()
@@ -59,6 +61,8 @@ class NavsimMMaDADataset(Dataset):
             num_history_frames=num_history_frames,
             num_future_frames=num_future_frames,
             target_future_seconds=target_future_seconds,
+            stitched_image_size=stitched_image_size,
+            front_image_size=front_image_size,
         )
         self.target_future_seconds = target_future_seconds
 
