@@ -26,15 +26,26 @@ def load_model_and_tokenizer(checkpoint_path, device="cuda"):
     print(f"Loading model from {checkpoint_path}...")
     
     # 加载配置
-    config_path = Path(checkpoint_path).parent / "config.yaml"
-    if not config_path.exists():
-        config_path = Path(checkpoint_path) / "config.yaml"
-    config = OmegaConf.load(config_path)
+    ckpt_path = Path(checkpoint_path)
+    config_path = None
     
-    # 加载tokenizer
+    # 尝试多个可能的配置文件位置
+    if (ckpt_path / "config.yaml").exists():
+        config_path = ckpt_path / "config.yaml"
+    elif (ckpt_path.parent / "config.yaml").exists():
+        config_path = ckpt_path.parent / "config.yaml"
+    else:
+        raise FileNotFoundError(f"config.yaml not found near {checkpoint_path}")
+    
+    config = OmegaConf.load(config_path)
+    print(f"Loaded config from {config_path}")
+    
+    # 加载tokenizer - 直接从原始预训练路径加载，避免MMadaConfig的问题
+    print(f"Loading tokenizer from {config.model.mmada.pretrained_model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(
         config.model.mmada.pretrained_model_path, 
-        padding_side="left"
+        padding_side="left",
+        trust_remote_code=True
     )
     
     # 初始化UniversalPrompting
