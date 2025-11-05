@@ -450,15 +450,12 @@ def main():
     )
     
     # 3. 获取指定样本
-    print(f"Getting sample {args.sample_idx}...")
-    for idx, batch in enumerate(navsim_loader):
-        if idx == args.sample_idx:
-            sample = {k: v[0] if isinstance(v, torch.Tensor) else v[0] 
-                     for k, v in batch.items()}
-            break
-    else:
-        print(f"Sample {args.sample_idx} not found!")
+    dataset = navsim_loader.dataset
+    if args.sample_idx < 0 or args.sample_idx >= len(dataset):
+        print(f"Sample {args.sample_idx} not found! Dataset size: {len(dataset)}")
         return
+    print(f"Fetching sample {args.sample_idx} directly from dataset (size={len(dataset)})...")
+    sample = dataset[args.sample_idx]
     
     # 4. 推理
     print(f"\n{'='*80}")
