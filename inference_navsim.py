@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+# Copyright 2025 MMaDA Team
+# NavSim Inference Script for Overfitting Visualization
+
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+import torch
+import numpy as np
+from PIL import Image
+from omegaconf import OmegaConf
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+from transformers import AutoTokenizer
+from models import MAGVITv2, MMadaModelLM, MMadaConfig
+from training.prompting_utils import UniversalPrompting
+from training.navsim_data.navsim_mmada_dataset import create_navsim_mmada_dataloader
+from training.navsim_data.action_tokens import action_token_vocab
+
+
+def load_model_and_tokenizer(checkpoint_path, device="cuda"):
+    """加载训练好的模型"""
+    print(f"Loading model from {checkpoint_path}...")
+    
+    # 加载配置
+    config_path = Path(checkpoint_path).parent / "config.yaml"
+    if not config_path.exists():
+        config_path = Path(checkpoint_path) / "config.yaml"
+    config = OmegaConf.load(config_path)
+    
+    # 加载tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.model.mmada.pretrained_model_path, 
+        padding_side="left"
+    )
+    
+    # 初始化UniversalPrompting
+    uni_prompting = UniversalPrompting(
+        tokenizer, 
+        max_text_len=config.dataset.preprocessing.max_seq_length,
+        special_tokens=(
+            "<|soi|>", "<|eoi|>", "<|sov|>", "<|eov|>", "<|t2i|>",
+            "<|mmu|>", "<|t2v|>", "<|v2v|>", "<|lvg|>"
+        ),
+        ignore_id=-100, 
+        cond_dropout_prob=0.0,  # 推理时不dropout
+        use_reserved_token=True
+    )
+    
+    # 注册NavSim特殊token
+    navsim_special_tokens = [
+        "<|navsim|>",
+        "<nav_hist_sep>",
+        "<nav_action_sep>",
+        "<nav_future_sep>",
+    ]
+    navsim_token_list = navsim_special_tokens + action_token_vocab()
+    uni_prompting.register_tokens(navsim_token_list)
+    
+    # 加载VQ模型
+    print("Loading VQ model...")
+    vq_model = MAGVITv2()
+    if config.model.vq_model.get("pretrained_model_path", None):
+        state_dict = torch.load(config.model.vq_model.pretrained_model_path)['model']
+        vq_model.load_state_dict(state_dict)
+    else:
+        vq_model = MAGVITv2.from_pretrained(config.model.vq_model.vq_model_name)
+    vq_model.eval()
+    vq_model.requires_grad_(False)
+    vq_model.to(device)
+    
+    # 加载MMaDA模型
+    print("Loading MMaDA model...")
+    total_vocab_size = config.model.mmada.new_vocab_size + len(navsim_token_list)
+    
+    model = MMadaModelLM.from_pretrained(
+        config.model.mmada.pretrained_model_path,
+        torch_dtype=torch.bfloat16,
+    )
+    model.resize_token_embeddings(total_vocab_size)
+    model.config.vocab_size = total_vocab_size
+    model.config.new_vocab_size = total_vocab_size
+    model.config.embedding_size = total_vocab_size
+    
+    # 加载checkpoint权重
+    ckpt_path = Path(checkpoint_path)
+    if (ckpt_path / "unwrapped_model" / "pytorch_model.bin").exists():
+        state_dict = torch.load(
+            ckpt_path / "unwrapped_model" / "pytorch_model.bin", 
+            map_location="cpu"
+        )
+        model.load_state_dict(state_dict, strict=True)
+        del state_dict
+    elif (ckpt_path / "unwrapped_model" / "model.safetensors.index.json").exists():
+        from transformers.modeling_utils import load_sharded_checkpoint
+        load_sharded_checkpoint(model, str(ckpt_path / "unwrapped_model/"))
+    else:
+        raise FileNotFoundError(f"No model weights found in {checkpoint_path}")
+    
+    model.eval()
+    model.requires_grad_(False)
+    model.to(device)
+    
+    print("Model loaded successfully!")
+    return model, vq_model, uni_prompting, config
+
+
+@torch.no_grad()
+def inference_navsim_sample(model, vq_model, uni_prompting, sample, config, device="cuda"):
+    """推理单个NavSim样本"""
+    
+    # 1. 准备历史帧
+    history_front = sample["history_front_images"].unsqueeze(0).to(device)  # [1, num_hist, C, H, W]
+    bsz, num_hist, channels, height, width = history_front.shape
+    history_flat = history_front.reshape(bsz * num_hist, channels, height, width)
+    token_offset = len(uni_prompting.text_tokenizer)
+    
+    # 编码历史帧为tokens
+    history_codes = vq_model.get_code(history_flat).long() + token_offset
+    history_codes = history_codes.view(bsz, num_hist, -1)
+    
+    # 2. 构建历史序列（用分隔符连接）
+    hist_sep_token = uni_prompting.sptids_dict['<nav_hist_sep>'].to(device).long().view(1)
+    history_sequences = []
+    for i in range(bsz):
+        pieces = []
+        for t in range(num_hist):
+            pieces.append(history_codes[i, t])
+            if t < num_hist - 1:
+                pieces.append(hist_sep_token)
+        history_sequences.append(torch.cat(pieces, dim=0))
+    
+    history_tensor = torch.stack(history_sequences, dim=0)  # [1, seq_len]
+    
+    # 3. 构建输入（不包含action和future）
+    # 格式: <|navsim|> <|soi|> history_tokens <|eoi|> <|sot|> prompt <nav_action_sep>
+    navsim_token = uni_prompting.sptids_dict['<|navsim|>'].to(device).long().view(1, 1)
+    soi_token = uni_prompting.sptids_dict['<|soi|>'].to(device).long().view(1, 1)
+    eoi_token = uni_prompting.sptids_dict['<|eoi|>'].to(device).long().view(1, 1)
+    sot_token = uni_prompting.sptids_dict['<|sot|>'].to(device).long().view(1, 1)
+    action_sep_token = uni_prompting.sptids_dict['<nav_action_sep>'].to(device).long().view(1, 1)
+    future_sep_token = uni_prompting.sptids_dict['<nav_future_sep>'].to(device).long().view(1, 1)
+    
+    # 编码prompt text
+    prompt_text = sample["prompt_text"]
+    prompt_ids = uni_prompting.text_tokenizer([prompt_text], return_tensors="pt")['input_ids'].to(device)
+    
+    # 构建初始输入
+    input_ids = torch.cat([
+        navsim_token,
+        soi_token,
+        history_tensor,
+        eoi_token,
+        sot_token,
+        prompt_ids,
+        action_sep_token,
+    ], dim=1)
+    
+    print(f"\n{'='*80}")
+    print(f"Input sequence length: {input_ids.shape[1]}")
+    print(f"History frames: {num_hist}")
+    print(f"Prompt: {prompt_text}")
+    
+    # 4. 自回归生成动作tokens
+    num_action_tokens = len(sample["action_tokens"])
+    print(f"Expected action tokens: {num_action_tokens}")
+    
+    generated_action_tokens = []
+    current_input = input_ids
+    
+    print("\n--- Generating Action Tokens ---")
+    for step in range(num_action_tokens):
+        outputs = model(input_ids=current_input)
+        logits = outputs.logits
+        
+        # 取最后一个位置的logits
+        next_token_logits = logits[0, -1, :]
+        next_token_id = torch.argmax(next_token_logits).item()
+        
+        # 检查是否是future_sep_token（提前结束）
+        if next_token_id == future_sep_token.item():
+            print(f"  Step {step}: Generated <nav_future_sep>, stopping action generation")
+            break
+        
+        generated_action_tokens.append(next_token_id)
+        
+        # 更新输入
+        current_input = torch.cat([
+            current_input, 
+            torch.tensor([[next_token_id]], device=device)
+        ], dim=1)
+        
+        # 解码token名称
+        token_text = uni_prompting.text_tokenizer.convert_ids_to_tokens([next_token_id])[0]
+        print(f"  Step {step}: {token_text} (id={next_token_id})")
+    
+    # 添加future_sep_token
+    current_input = torch.cat([current_input, future_sep_token], dim=1)
+    current_input = torch.cat([current_input, soi_token], dim=1)
+    
+    # 5. 生成未来帧tokens
+    num_vq_tokens = config.model.mmada.num_vq_tokens
+    print(f"\n--- Generating Future Frame Tokens ({num_vq_tokens} tokens) ---")
+    
+    generated_future_tokens = []
+    for step in range(num_vq_tokens):
+        outputs = model(input_ids=current_input)
+        logits = outputs.logits
+        
+        # 只考虑codebook范围内的tokens
+        next_token_logits = logits[0, -1, token_offset:token_offset + config.model.mmada.codebook_size]
+        next_token_id = torch.argmax(next_token_logits).item() + token_offset
+        
+        generated_future_tokens.append(next_token_id - token_offset)
+        
+        current_input = torch.cat([
+            current_input, 
+            torch.tensor([[next_token_id]], device=device)
+        ], dim=1)
+        
+        if (step + 1) % 64 == 0:
+            print(f"  Generated {step + 1}/{num_vq_tokens} tokens...")
+    
+    print(f"  Generated {num_vq_tokens} future frame tokens")
+    
+    # 6. 解码图像
+    generated_future_tokens_tensor = torch.tensor(
+        [generated_future_tokens], 
+        device=device, 
+        dtype=torch.long
+    )
+    pred_future_image = vq_model.decode_code(generated_future_tokens_tensor)
+    
+    # 解码GT未来图像
+    gt_future_front = sample["future_front_image"].unsqueeze(0).to(device)
+    gt_future_tokens = vq_model.get_code(gt_future_front).long()
+    recon_gt_future = vq_model.decode_code(gt_future_tokens)
+    
+    return {
+        'generated_action_tokens': generated_action_tokens,
+        'gt_action_tokens': sample["action_tokens"],
+        'pred_future_image': pred_future_image,
+        'gt_future_image': gt_future_front,
+        'recon_gt_future': recon_gt_future,
+        'history_images': history_front,
+        'prompt_text': prompt_text,
+    }
+
+
+def visualize_results(results, save_path="navsim_inference_result.png"):
+    """可视化推理结果"""
+    
+    # 1. 打印动作对比
+    print(f"\n{'='*80}")
+    print("ACTION COMPARISON:")
+    print(f"{'='*80}")
+    
+    gt_actions = results['gt_action_tokens']
+    pred_action_ids = results['generated_action_tokens']
+    
+    # 将预测的token ID转换为token文本（需要tokenizer）
+    # 这里我们直接显示ID，也可以传tokenizer进来解码
+    
+    print(f"\n{'Index':<8} {'GT Action':<30} {'Predicted ID':<15} {'Match'}")
+    print("-" * 80)
+    
+    num_actions = min(len(gt_actions), len(pred_action_ids))
+    matches = 0
+    
+    for i in range(max(len(gt_actions), len(pred_action_ids))):
+        if i < len(gt_actions) and i < len(pred_action_ids):
+            gt_token = gt_actions[i]
+            pred_id = pred_action_ids[i]
+            # 简单检查：这里我们打印出来，实际需要解码
+            match = "✓" if str(pred_id) in str(gt_token) else "✗"
+            if match == "✓":
+                matches += 1
+            print(f"{i:<8} {gt_token:<30} {pred_id:<15} {match}")
+        elif i < len(gt_actions):
+            print(f"{i:<8} {gt_actions[i]:<30} {'MISSING':<15} ✗")
+        else:
+            print(f"{i:<8} {'MISSING':<30} {pred_action_ids[i]:<15} ✗")
+    
+    accuracy = matches / num_actions * 100 if num_actions > 0 else 0
+    print(f"\nAction Accuracy: {matches}/{num_actions} = {accuracy:.2f}%")
+    
+    # 2. 可视化图像
+    print(f"\n{'='*80}")
+    print("IMAGE VISUALIZATION:")
+    print(f"{'='*80}")
+    
+    def tensor_to_image(tensor):
+        """将tensor转换为numpy图像"""
+        img = tensor.squeeze(0).cpu()
+        img = torch.clamp((img + 1.0) / 2.0, 0.0, 1.0)
+        img = img.permute(1, 2, 0).numpy()
+        return (img * 255).astype(np.uint8)
+    
+    # 准备历史帧
+    num_hist = results['history_images'].shape[1]
+    history_imgs = [
+        tensor_to_image(results['history_images'][0, i]) 
+        for i in range(num_hist)
+    ]
+    
+    # 准备未来帧
+    gt_future_img = tensor_to_image(results['gt_future_image'])
+    pred_future_img = tensor_to_image(results['pred_future_image'])
+    recon_gt_img = tensor_to_image(results['recon_gt_future'])
+    
+    # 创建可视化
+    fig, axes = plt.subplots(2, num_hist + 1, figsize=(4 * (num_hist + 1), 8))
+    
+    # 第一行：历史帧 + GT未来帧
+    for i in range(num_hist):
+        axes[0, i].imshow(history_imgs[i])
+        axes[0, i].set_title(f'History Frame {i+1}')
+        axes[0, i].axis('off')
+    axes[0, num_hist].imshow(gt_future_img)
+    axes[0, num_hist].set_title('GT Future Frame')
+    axes[0, num_hist].axis('off')
+    
+    # 第二行：历史帧（重复） + 预测未来帧
+    for i in range(num_hist):
+        axes[1, i].imshow(history_imgs[i])
+        axes[1, i].set_title(f'History Frame {i+1}')
+        axes[1, i].axis('off')
+    axes[1, num_hist].imshow(pred_future_img)
+    axes[1, num_hist].set_title('Predicted Future Frame')
+    axes[1, num_hist].axis('off')
+    
+    plt.suptitle(f"NavSim Inference Result\nPrompt: {results['prompt_text']}", 
+                 fontsize=14, y=0.98)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"\nVisualization saved to: {save_path}")
+    
+    # 计算图像相似度（简单的MSE）
+    mse = np.mean((gt_future_img.astype(float) - pred_future_img.astype(float)) ** 2)
+    print(f"Future Frame MSE: {mse:.2f}")
+    
+    return fig
+
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="NavSim Inference Script")
+    parser.add_argument("--checkpoint", type=str, required=True, 
+                       help="Path to checkpoint directory")
+    parser.add_argument("--config_path", type=str, default=None,
+                       help="Path to training config (will auto-detect from checkpoint if not provided)")
+    parser.add_argument("--sample_idx", type=int, default=0,
+                       help="Index of sample to visualize")
+    parser.add_argument("--output", type=str, default="navsim_inference_result.png",
+                       help="Output image path")
+    parser.add_argument("--device", type=str, default="cuda",
+                       help="Device to use")
+    
+    args = parser.parse_args()
+    
+    # 1. 加载模型
+    model, vq_model, uni_prompting, config = load_model_and_tokenizer(
+        args.checkpoint, 
+        device=args.device
+    )
+    
+    # 2. 加载数据
+    print("\nLoading NavSim dataset...")
+    navsim_cfg = config.dataset.params.navsim
+    navsim_params = OmegaConf.to_container(navsim_cfg, resolve=True)
+    
+    navsim_loader = create_navsim_mmada_dataloader(
+        json_path=navsim_params["json_path"],
+        navsim_log_path=navsim_params["navsim_log_path"],
+        sensor_blobs_path=navsim_params["sensor_blobs_path"],
+        batch_size=1,  # 单个样本
+        num_workers=0,
+        shuffle=False,
+        pin_memory=False,
+        persistent_workers=False,
+        drop_last=False,
+        num_history_frames=navsim_params.get("num_history_frames", 4),
+        num_future_frames=navsim_params.get("num_future_frames", 8),
+        target_future_seconds=navsim_params.get("target_future_seconds", 4.0),
+    )
+    
+    # 3. 获取指定样本
+    print(f"Getting sample {args.sample_idx}...")
+    for idx, batch in enumerate(navsim_loader):
+        if idx == args.sample_idx:
+            sample = {k: v[0] if isinstance(v, torch.Tensor) else v[0] 
+                     for k, v in batch.items()}
+            break
+    else:
+        print(f"Sample {args.sample_idx} not found!")
+        return
+    
+    # 4. 推理
+    print(f"\n{'='*80}")
+    print("RUNNING INFERENCE...")
+    print(f"{'='*80}")
+    
+    results = inference_navsim_sample(
+        model, vq_model, uni_prompting, sample, config, device=args.device
+    )
+    
+    # 5. 可视化
+    visualize_results(results, save_path=args.output)
+    
+    print(f"\n{'='*80}")
+    print("INFERENCE COMPLETED!")
+    print(f"{'='*80}\n")
+
+
+if __name__ == "__main__":
+    main()
+
