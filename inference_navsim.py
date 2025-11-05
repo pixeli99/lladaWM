@@ -4,6 +4,7 @@
 
 import os
 import sys
+import math
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
@@ -120,7 +121,19 @@ def load_model_and_tokenizer(checkpoint_path, config_path=None, device="cuda"):
 
 
 @torch.no_grad()
-def inference_navsim_sample(model, vq_model, uni_prompting, sample, config, device="cuda"):
+def inference_navsim_sample(
+    model,
+    vq_model,
+    uni_prompting,
+    sample,
+    config,
+    device="cuda",
+    decoding_steps=128,
+    block_length=None,
+    temperature=0.0,
+    cfg_scale=0.0,
+    remasking="low_confidence",
+):
     """推理单个NavSim样本"""
     
     # 1. 准备历史帧
@@ -133,8 +146,9 @@ def inference_navsim_sample(model, vq_model, uni_prompting, sample, config, devi
     history_codes = vq_model.get_code(history_flat).long() + token_offset
     history_codes = history_codes.view(bsz, num_hist, -1)
     
-    # 2. 构建历史序列（用分隔符连接）
+    # 2. 构建历史序列（用分隔符连接，并与训练相同地进行pad）
     hist_sep_token = uni_prompting.sptids_dict['<nav_hist_sep>'].to(device).long().view(1)
+    pad_value = torch.tensor([uni_prompting.pad_id], device=device, dtype=torch.long)
     history_sequences = []
     for i in range(bsz):
         pieces = []
@@ -142,22 +156,39 @@ def inference_navsim_sample(model, vq_model, uni_prompting, sample, config, devi
             pieces.append(history_codes[i, t])
             if t < num_hist - 1:
                 pieces.append(hist_sep_token)
-        history_sequences.append(torch.cat(pieces, dim=0))
+        seq = torch.cat(pieces, dim=0)
+        history_sequences.append(seq)
+    max_history_len = max(seq.shape[0] for seq in history_sequences)
+    padded_histories = []
+    for seq in history_sequences:
+        if seq.shape[0] < max_history_len:
+            pad = pad_value.repeat(max_history_len - seq.shape[0])
+            seq = torch.cat((pad, seq), dim=0)
+        padded_histories.append(seq)
+    history_tensor = torch.stack(padded_histories, dim=0)  # [1, seq_len]
     
-    history_tensor = torch.stack(history_sequences, dim=0)  # [1, seq_len]
-    
-    # 3. 构建输入（不包含action和future）
-    # 格式: <|navsim|> <|soi|> history_tokens <|eoi|> <|sot|> prompt <nav_action_sep>
+    # 3. 构建输入（不包含action和future），与训练的数据流保持一致
     navsim_token = uni_prompting.sptids_dict['<|navsim|>'].to(device).long().view(1, 1)
     soi_token = uni_prompting.sptids_dict['<|soi|>'].to(device).long().view(1, 1)
     eoi_token = uni_prompting.sptids_dict['<|eoi|>'].to(device).long().view(1, 1)
-    sot_token = uni_prompting.sptids_dict['<|sot|>'].to(device).long().view(1, 1)
     action_sep_token = uni_prompting.sptids_dict['<nav_action_sep>'].to(device).long().view(1, 1)
     future_sep_token = uni_prompting.sptids_dict['<nav_future_sep>'].to(device).long().view(1, 1)
     
-    # 编码prompt text
+    # 编码prompt text，遵循训练时的padding/truncation方式
     prompt_text = sample["prompt_text"]
-    prompt_ids = uni_prompting.text_tokenizer([prompt_text], return_tensors="pt")['input_ids'].to(device)
+    prompt_token_ids = uni_prompting.text_tokenizer([prompt_text], truncation=True)['input_ids'][0]
+    if len(prompt_token_ids) == 0:
+        prompt_token_ids = [uni_prompting.text_tokenizer.bos_token_id]
+    elif prompt_token_ids[0] != uni_prompting.text_tokenizer.bos_token_id:
+        prompt_token_ids = [uni_prompting.text_tokenizer.bos_token_id] + prompt_token_ids
+    prompt_token_ids = prompt_token_ids + [uni_prompting.text_tokenizer.eos_token_id]
+    
+    max_text_len = max(1, uni_prompting.max_text_len - 1)
+    if max_text_len >= len(prompt_token_ids):
+        prompt_token_ids = prompt_token_ids + [uni_prompting.text_tokenizer.eos_token_id] * (max_text_len - len(prompt_token_ids))
+    else:
+        prompt_token_ids = prompt_token_ids[:max_text_len - 1] + [uni_prompting.text_tokenizer.eos_token_id]
+    prompt_ids = torch.tensor(prompt_token_ids, device=device, dtype=torch.long).unsqueeze(0)
     
     # 构建初始输入
     input_ids = torch.cat([
@@ -165,7 +196,6 @@ def inference_navsim_sample(model, vq_model, uni_prompting, sample, config, devi
         soi_token,
         history_tensor,
         eoi_token,
-        sot_token,
         prompt_ids,
         action_sep_token,
     ], dim=1)
@@ -175,67 +205,63 @@ def inference_navsim_sample(model, vq_model, uni_prompting, sample, config, devi
     print(f"History frames: {num_hist}")
     print(f"Prompt: {prompt_text}")
     
-    # 4. 自回归生成动作tokens
-    num_action_tokens = len(sample["action_tokens"])
-    print(f"Expected action tokens: {num_action_tokens}")
-    
-    generated_action_tokens = []
-    current_input = input_ids
-    
-    print("\n--- Generating Action Tokens ---")
-    for step in range(num_action_tokens):
-        outputs = model(input_ids=current_input)
-        logits = outputs.logits
-        
-        # 取最后一个位置的logits
-        next_token_logits = logits[0, -1, :]
-        next_token_id = torch.argmax(next_token_logits).item()
-        
-        # 检查是否是future_sep_token（提前结束）
-        if next_token_id == future_sep_token.item():
-            print(f"  Step {step}: Generated <nav_future_sep>, stopping action generation")
-            break
-        
-        generated_action_tokens.append(next_token_id)
-        
-        # 更新输入
-        current_input = torch.cat([
-            current_input, 
-            torch.tensor([[next_token_id]], device=device)
-        ], dim=1)
-        
-        # 解码token名称
-        token_text = uni_prompting.text_tokenizer.convert_ids_to_tokens([next_token_id])[0]
-        print(f"  Step {step}: {token_text} (id={next_token_id})")
-    
-    # 添加future_sep_token
-    current_input = torch.cat([current_input, future_sep_token], dim=1)
-    current_input = torch.cat([current_input, soi_token], dim=1)
-    
-    # 5. 生成未来帧tokens
+    # 4. 使用掩码生成器（非自回归）解码后续tokens
+    gt_action_tokens = sample["action_tokens"]
+    gt_action_token_ids = [
+        uni_prompting.text_tokenizer.convert_tokens_to_ids(token) for token in gt_action_tokens
+    ]
+    expected_action_tokens = len(gt_action_token_ids)
     num_vq_tokens = config.model.mmada.num_vq_tokens
-    print(f"\n--- Generating Future Frame Tokens ({num_vq_tokens} tokens) ---")
+    suffix_tokens = expected_action_tokens + 1 + 1 + num_vq_tokens + 1  # actions + <nav_future_sep> + <|soi|> + future + <|eoi|>
     
-    generated_future_tokens = []
-    for step in range(num_vq_tokens):
-        outputs = model(input_ids=current_input)
-        logits = outputs.logits
-        
-        # 只考虑codebook范围内的tokens
-        next_token_logits = logits[0, -1, token_offset:token_offset + config.model.mmada.codebook_size]
-        next_token_id = torch.argmax(next_token_logits).item() + token_offset
-        
-        generated_future_tokens.append(next_token_id - token_offset)
-        
-        current_input = torch.cat([
-            current_input, 
-            torch.tensor([[next_token_id]], device=device)
-        ], dim=1)
-        
-        if (step + 1) % 64 == 0:
-            print(f"  Generated {step + 1}/{num_vq_tokens} tokens...")
+    print(f"Expected action tokens: {expected_action_tokens}")
+    print(f"Total tokens to generate (actions + future + specials): {suffix_tokens}")
     
-    print(f"  Generated {num_vq_tokens} future frame tokens")
+    if block_length is None or block_length <= 0 or suffix_tokens % block_length != 0:
+        if block_length not in (None, 0):
+            print(f"Adjusting block_length from {block_length} to {suffix_tokens} to fit suffix length.")
+        block_length = suffix_tokens
+    num_blocks = suffix_tokens // block_length
+    if decoding_steps % num_blocks != 0:
+        adjusted_steps = math.ceil(decoding_steps / num_blocks) * num_blocks
+        print(f"Adjusting decoding steps from {decoding_steps} to {adjusted_steps} to align with {num_blocks} block(s).")
+        decoding_steps = adjusted_steps
+    
+    mask_token_id = getattr(model.config, "mask_token_id", None)
+    if mask_token_id is None:
+        print("Warning: model.config.mask_token_id is None, defaulting to 126336.")
+        mask_token_id = 126336
+    
+    generated_full = model.mmu_generate(
+        idx=input_ids,
+        max_new_tokens=suffix_tokens,
+        steps=decoding_steps,
+        block_length=block_length,
+        temperature=temperature,
+        cfg_scale=cfg_scale,
+        remasking=remasking,
+        mask_id=mask_token_id,
+    )
+    
+    generated_suffix = generated_full[:, input_ids.shape[1]:]
+    generated_action_tokens = generated_suffix[0, :expected_action_tokens].tolist()
+    nav_future_sep_pred = generated_suffix[0, expected_action_tokens].item()
+    future_soi_pred = generated_suffix[0, expected_action_tokens + 1].item()
+    future_token_slice = generated_suffix[0, expected_action_tokens + 2:expected_action_tokens + 2 + num_vq_tokens]
+    future_eoi_pred = generated_suffix[0, expected_action_tokens + 2 + num_vq_tokens].item()
+    
+    nav_future_sep_id = uni_prompting.sptids_dict['<nav_future_sep>'].item()
+    soi_id = uni_prompting.sptids_dict['<|soi|>'].item()
+    eoi_id = uni_prompting.sptids_dict['<|eoi|>'].item()
+    
+    if nav_future_sep_pred != nav_future_sep_id:
+        print(f"Warning: expected <nav_future_sep> (id={nav_future_sep_id}) but got id={nav_future_sep_pred}.")
+    if future_soi_pred != soi_id:
+        print(f"Warning: expected future <|soi|> (id={soi_id}) but got id={future_soi_pred}.")
+    if future_eoi_pred != eoi_id:
+        print(f"Warning: expected future <|eoi|> (id={eoi_id}) but got id={future_eoi_pred}.")
+    
+    generated_future_tokens = (future_token_slice - token_offset).clamp(min=0, max=config.model.mmada.codebook_size - 1).tolist()
     
     # 6. 解码图像
     generated_future_tokens_tensor = torch.tensor(
@@ -253,6 +279,7 @@ def inference_navsim_sample(model, vq_model, uni_prompting, sample, config, devi
     return {
         'generated_action_tokens': generated_action_tokens,
         'gt_action_tokens': sample["action_tokens"],
+        'gt_action_token_ids': gt_action_token_ids,
         'pred_future_image': pred_future_image,
         'gt_future_image': gt_future_front,
         'recon_gt_future': recon_gt_future,
@@ -261,7 +288,7 @@ def inference_navsim_sample(model, vq_model, uni_prompting, sample, config, devi
     }
 
 
-def visualize_results(results, save_path="navsim_inference_result.png"):
+def visualize_results(results, uni_prompting, save_path="navsim_inference_result.png"):
     """可视化推理结果"""
     
     # 1. 打印动作对比
@@ -269,31 +296,42 @@ def visualize_results(results, save_path="navsim_inference_result.png"):
     print("ACTION COMPARISON:")
     print(f"{'='*80}")
     
+    tokenizer = uni_prompting.text_tokenizer
+    token_offset = len(tokenizer)
     gt_actions = results['gt_action_tokens']
+    gt_action_ids = results.get('gt_action_token_ids', [])
     pred_action_ids = results['generated_action_tokens']
+    pred_action_tokens = []
+    for token_id in pred_action_ids:
+        if 0 <= token_id < len(tokenizer):
+            pred_action_tokens.append(tokenizer.convert_ids_to_tokens([token_id])[0])
+        elif token_id >= token_offset:
+            pred_action_tokens.append(f"<vq_{token_id - token_offset}>")
+        else:
+            pred_action_tokens.append(f"ID_{token_id}")
     
-    # 将预测的token ID转换为token文本（需要tokenizer）
-    # 这里我们直接显示ID，也可以传tokenizer进来解码
-    
-    print(f"\n{'Index':<8} {'GT Action':<30} {'Predicted ID':<15} {'Match'}")
+    print(f"\n{'Index':<8} {'GT Action':<30} {'Predicted Token':<25} {'Match'}")
     print("-" * 80)
     
-    num_actions = min(len(gt_actions), len(pred_action_ids))
+    num_actions = min(len(gt_action_ids), len(pred_action_ids)) if gt_action_ids else min(len(gt_actions), len(pred_action_ids))
     matches = 0
     
     for i in range(max(len(gt_actions), len(pred_action_ids))):
         if i < len(gt_actions) and i < len(pred_action_ids):
             gt_token = gt_actions[i]
-            pred_id = pred_action_ids[i]
-            # 简单检查：这里我们打印出来，实际需要解码
-            match = "✓" if str(pred_id) in str(gt_token) else "✗"
+            pred_token = pred_action_tokens[i]
+            if gt_action_ids:
+                match = "✓" if gt_action_ids[i] == pred_action_ids[i] else "✗"
+            else:
+                match = "✓" if gt_token == pred_token else "✗"
             if match == "✓":
                 matches += 1
-            print(f"{i:<8} {gt_token:<30} {pred_id:<15} {match}")
+            print(f"{i:<8} {gt_token:<30} {pred_token:<25} {match}")
         elif i < len(gt_actions):
-            print(f"{i:<8} {gt_actions[i]:<30} {'MISSING':<15} ✗")
+            print(f"{i:<8} {gt_actions[i]:<30} {'MISSING':<25} ✗")
         else:
-            print(f"{i:<8} {'MISSING':<30} {pred_action_ids[i]:<15} ✗")
+            pred_token = pred_action_tokens[i] if i < len(pred_action_tokens) else str(pred_action_ids[i])
+            print(f"{i:<8} {'MISSING':<30} {pred_token:<25} ✗")
     
     accuracy = matches / num_actions * 100 if num_actions > 0 else 0
     print(f"\nAction Accuracy: {matches}/{num_actions} = {accuracy:.2f}%")
@@ -370,6 +408,17 @@ def main():
                        help="Output image path")
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device to use")
+    parser.add_argument("--decoding_steps", type=int, default=128,
+                       help="Mask decoding steps for NavSim suffix generation")
+    parser.add_argument("--block_length", type=int, default=None,
+                       help="Block length for NavSim generation (must divide generated length). Defaults to suffix length.")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                       help="Sampling temperature (0 = greedy)")
+    parser.add_argument("--cfg_scale", type=float, default=0.0,
+                       help="Classifier-free guidance scale")
+    parser.add_argument("--remasking", type=str, default="low_confidence",
+                       choices=["low_confidence", "random"],
+                       help="Remasking strategy for iterative decoding")
     
     args = parser.parse_args()
     
@@ -417,11 +466,21 @@ def main():
     print(f"{'='*80}")
     
     results = inference_navsim_sample(
-        model, vq_model, uni_prompting, sample, config, device=args.device
+        model,
+        vq_model,
+        uni_prompting,
+        sample,
+        config,
+        device=args.device,
+        decoding_steps=args.decoding_steps,
+        block_length=args.block_length,
+        temperature=args.temperature,
+        cfg_scale=args.cfg_scale,
+        remasking=args.remasking,
     )
     
     # 5. 可视化
-    visualize_results(results, save_path=args.output)
+    visualize_results(results, uni_prompting, save_path=args.output)
     
     print(f"\n{'='*80}")
     print("INFERENCE COMPLETED!")
@@ -430,4 +489,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
