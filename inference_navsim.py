@@ -21,29 +21,29 @@ from training.navsim_data.navsim_mmada_dataset import create_navsim_mmada_datalo
 from training.navsim_data.action_tokens import action_token_vocab
 
 
-def load_model_and_tokenizer(checkpoint_path, device="cuda"):
+def load_model_and_tokenizer(checkpoint_path, config_path=None, device="cuda"):
     """加载训练好的模型"""
     print(f"Loading model from {checkpoint_path}...")
     
     # 加载配置
-    ckpt_path = Path(checkpoint_path)
-    config_path = None
-    
-    # 尝试多个可能的配置文件位置
-    if (ckpt_path / "config.yaml").exists():
-        config_path = ckpt_path / "config.yaml"
-    elif (ckpt_path.parent / "config.yaml").exists():
-        config_path = ckpt_path.parent / "config.yaml"
-    else:
-        raise FileNotFoundError(f"config.yaml not found near {checkpoint_path}")
+    if config_path is None:
+        # 尝试从checkpoint目录查找
+        ckpt_path = Path(checkpoint_path)
+        if (ckpt_path / "config.yaml").exists():
+            config_path = ckpt_path / "config.yaml"
+        elif (ckpt_path.parent / "config.yaml").exists():
+            config_path = ckpt_path.parent / "config.yaml"
+        else:
+            raise FileNotFoundError(f"config.yaml not found near {checkpoint_path}. Please specify --config_path")
     
     config = OmegaConf.load(config_path)
     print(f"Loaded config from {config_path}")
     
-    # 加载tokenizer - 直接从原始预训练路径加载，避免MMadaConfig的问题
-    print(f"Loading tokenizer from {config.model.mmada.pretrained_model_path}...")
+    # 加载tokenizer - 从配置文件指定的tokenizer路径加载
+    tokenizer_path = config.model.mmada.tokenizer_path
+    print(f"Loading tokenizer from {tokenizer_path}...")
     tokenizer = AutoTokenizer.from_pretrained(
-        config.model.mmada.pretrained_model_path, 
+        tokenizer_path, 
         padding_side="left",
         trust_remote_code=True
     )
@@ -375,7 +375,8 @@ def main():
     
     # 1. 加载模型
     model, vq_model, uni_prompting, config = load_model_and_tokenizer(
-        args.checkpoint, 
+        args.checkpoint,
+        config_path=args.config_path,
         device=args.device
     )
     
