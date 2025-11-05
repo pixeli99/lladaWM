@@ -26,10 +26,10 @@ from typing import Union
 import numpy as np
 from PIL import Image
 from omegaconf import OmegaConf
-import wandb
 import torch
 from torch.optim import AdamW
 from lightning.pytorch.utilities import CombinedLoader
+from torch.utils.tensorboard import SummaryWriter
 
 from transformers import AutoTokenizer, AutoConfig
 from accelerate import Accelerator
@@ -92,7 +92,7 @@ def main():
     accelerator = Accelerator(
         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
         mixed_precision=config.training.mixed_precision,
-        log_with="wandb",
+        log_with="tensorboard",
         project_dir=config.experiment.logging_dir,
         split_batches=True,
     )
@@ -131,27 +131,12 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        resume_wandb_run = config.wandb.resume
-        run_id = config.wandb.get("run_id", None)
-        if run_id is None:
-            resume_wandb_run = False
-            run_id = wandb.util.generate_id()
-            config.wandb.run_id = run_id
-
-        wandb_init_kwargs = dict(
-            name=config.experiment.name,
-            id=run_id,
-            resume=resume_wandb_run,
-            entity=config.wandb.get("entity", None),
-            config_exclude_keys=[],
-        )
-        wandb_config = {k: v for k, v in flatten_omega_conf(config, resolve=True)}
-        wandb_config.pop("experiment.resume_from_checkpoint")
-
+        tracker_config = {k: v for k, v in flatten_omega_conf(config, resolve=True)}
+        tracker_config.pop("experiment.resume_from_checkpoint", None)
+        
         accelerator.init_trackers(
             config.experiment.project,
-            config=wandb_config,
-            init_kwargs={"wandb": wandb_init_kwargs},
+            config=tracker_config,
         )
 
     if accelerator.is_main_process:
@@ -1035,10 +1020,13 @@ def visualize_predictions(
     predicted_images = np.concatenate((images, recons_images, predicted_images), 2)
     pil_images = [Image.fromarray(image) for image in predicted_images]
 
-    # Log images
-    wandb_images = [wandb.Image(image, caption=f'mask ratio: {r:0.2f} \n caption: {texts[i]}') for i, (image, r) in
-                    enumerate(zip(pil_images, mask_ratio))]
-    wandb.log({"Original images v.s. Reconstructed images v.s. Predicted images": wandb_images}, step=global_step)
+    # Log images to tensorboard
+    # Convert to tensor format (C, H, W) and normalize to [0, 1]
+    for i, (pil_img, r) in enumerate(zip(pil_images[:8], mask_ratio[:8])):  # Log first 8 images
+        img_tensor = torch.from_numpy(np.array(pil_img)).permute(2, 0, 1).float() / 255.0
+        accelerator.log({
+            f"predictions/image_{i}_mask_{r:.2f}": img_tensor,
+        }, step=global_step)
 
     model.train()
 
@@ -1111,9 +1099,12 @@ def generate_images(
     images = images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
     pil_images = [Image.fromarray(image) for image in images]
 
-    # Log images
-    wandb_images = [wandb.Image(image, caption=validation_prompts[i]) for i, image in enumerate(pil_images)]
-    wandb.log({"Generated images": wandb_images}, step=global_step)
+    # Log images to tensorboard
+    for i, pil_img in enumerate(pil_images[:8]):  # Log first 8 images
+        img_tensor = torch.from_numpy(np.array(pil_img)).permute(2, 0, 1).float() / 255.0
+        accelerator.log({
+            f"generated/image_{i}": img_tensor,
+        }, step=global_step)
     
     
 
@@ -1176,9 +1167,12 @@ def understanding_images(
     images = images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
     pil_images = [Image.fromarray(image) for image in images]
 
-    # Log images
-    wandb_images = [wandb.Image(image, caption=responses[i]) for i, image in enumerate(pil_images)]
-    wandb.log({"Understanding images": wandb_images}, step=global_step)
+    # Log images to tensorboard
+    for i, pil_img in enumerate(pil_images[:8]):  # Log first 8 images
+        img_tensor = torch.from_numpy(np.array(pil_img)).permute(2, 0, 1).float() / 255.0
+        accelerator.log({
+            f"understanding/image_{i}": img_tensor,
+        }, step=global_step)
 
 
 def save_checkpoint(model, config, accelerator, global_step):

@@ -183,11 +183,11 @@ def inference_navsim_sample(
         prompt_token_ids = [uni_prompting.text_tokenizer.bos_token_id] + prompt_token_ids
     prompt_token_ids = prompt_token_ids + [uni_prompting.text_tokenizer.eos_token_id]
     
-    max_text_len = max(1, uni_prompting.max_text_len - 1)
-    if max_text_len >= len(prompt_token_ids):
-        prompt_token_ids = prompt_token_ids + [uni_prompting.text_tokenizer.eos_token_id] * (max_text_len - len(prompt_token_ids))
-    else:
-        prompt_token_ids = prompt_token_ids[:max_text_len - 1] + [uni_prompting.text_tokenizer.eos_token_id]
+    # max_text_len = max(1, uni_prompting.max_text_len - 1)
+    # if max_text_len >= len(prompt_token_ids):
+    #     prompt_token_ids = prompt_token_ids + [uni_prompting.text_tokenizer.eos_token_id] * (max_text_len - len(prompt_token_ids))
+    # else:
+    #     prompt_token_ids = prompt_token_ids[:max_text_len - 1] + [uni_prompting.text_tokenizer.eos_token_id]
     prompt_ids = torch.tensor(prompt_token_ids, device=device, dtype=torch.long).unsqueeze(0)
     
     # 构建初始输入
