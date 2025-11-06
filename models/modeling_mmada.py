@@ -527,7 +527,7 @@ class MMadaModelLM(LLaDAModelLM):
                     raise NotImplementedError(remasking)
 
                 # x0_p[:, idx.shape[1] + (num_block + 1) * block_length:] = -np.inf
-                x0_p[:, processed_clamp_ranges[1]:] = -np.inf
+                x0_p[:, processed_clamp_ranges[0][1]:] = -np.inf
 
                 x0 = torch.where(mask_index, x0, x)
                 # 不再需要在token ID上clamp，因为已经在logits层面限制了
@@ -668,7 +668,7 @@ class MMadaModelLM(LLaDAModelLM):
                     raise NotImplementedError(remasking)
 
                 # x0_p[:, idx.shape[1] + (num_block + 1) * block_length:] = -np.inf
-                x0_p[:, processed_clamp_ranges[1]:] = -np.inf
+                x0_p[:, processed_clamp_ranges[0][1]:] = -np.inf
 
                 x0 = torch.where(mask_index, x0, x)
                 # 不再需要在token ID上clamp，因为已经在logits层面限制了
