@@ -216,20 +216,6 @@ def inference_navsim_sample(
     print(f"Expected action tokens: {expected_action_tokens}")
     print(f"Generating 16 action tokens followed by {num_vq_tokens} image tokens (fixed setup).")
 
-    def resolve_block_and_steps(max_tokens: int, block_hint: int | None):
-        block = block_hint
-        if block is None or block <= 0 or max_tokens % block != 0:
-            if block not in (None, 0):
-                print(f"Adjusting block_length from {block} to {max_tokens} to fit suffix length.")
-            block = max_tokens
-        num_blocks_local = max(1, max_tokens // block)
-        steps_local = decoding_steps
-        if steps_local % num_blocks_local != 0:
-            adjusted_steps = math.ceil(steps_local / num_blocks_local) * num_blocks_local
-            print(f"Adjusting decoding steps from {steps_local} to {adjusted_steps} to align with {num_blocks_local} block(s).")
-            steps_local = adjusted_steps
-        return block, steps_local
-
     mask_token_id = getattr(model.config, "mask_token_id", None)
     if mask_token_id is None:
         print("Warning: model.config.mask_token_id is None, defaulting to 126336.")
@@ -258,12 +244,11 @@ def inference_navsim_sample(
         )
     ]
 
-    action_block_length, action_steps = resolve_block_and_steps(num_action_tokens, block_length)
     actions_full = model.mmu_generate(
         idx=input_ids,
-        max_new_tokens=num_action_tokens,
-        steps=action_steps,
-        block_length=action_block_length,
+        max_new_tokens=num_action_tokens + 3 + 128,
+        steps=147,
+        block_length=147,
         temperature=temperature,
         cfg_scale=cfg_scale,
         remasking=remasking,
@@ -295,12 +280,11 @@ def inference_navsim_sample(
         )
     ]
 
-    future_block_length, future_steps = resolve_block_and_steps(num_vq_tokens, block_length)
     future_full = model.mmu_generate(
         idx=future_prefix,
-        max_new_tokens=num_vq_tokens,
-        steps=future_steps,
-        block_length=future_block_length,
+        max_new_tokens=129,
+        steps=129,
+        block_length=129,
         temperature=temperature,
         cfg_scale=cfg_scale,
         remasking=remasking,
@@ -323,7 +307,7 @@ def inference_navsim_sample(
     
     # 解码GT未来图像
     gt_future_front = sample["future_front_image"].unsqueeze(0).to(device)
-    gt_future_tokens = vq_model.get_code(gt_future_front).long()
+    # gt_future_tokens = vq_model.get_code(gt_future_front).long()
     # recon_gt_future = vq_model.decode_code(gt_future_tokens)
     
     return {

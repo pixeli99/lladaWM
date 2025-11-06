@@ -459,25 +459,31 @@ class MMadaModelLM(LLaDAModelLM):
                     )
                 )
 
-        def apply_clamp(values, mask):
+        def apply_logits_mask(logits):
+            """
+            在logits层面进行masking，把不允许的token的logit设为-inf
+            这样在argmax时就不会采样到这些token
+            """
             if not processed_clamp_ranges:
-                return values
-            output = values
+                return logits
+            
             for start_idx, end_idx, lower, upper in processed_clamp_ranges:
                 range_mask = (clamp_position_ids >= start_idx) & (clamp_position_ids < end_idx)
                 if not torch.any(range_mask):
                     continue
-                range_mask = range_mask.unsqueeze(0).expand_as(values)
-                target_mask = mask & range_mask
-                if not torch.any(target_mask):
-                    continue
-                temp = output
-                if lower is not None:
-                    temp = torch.clamp(temp, min=lower)
-                if upper is not None:
-                    temp = torch.clamp(temp, max=upper)
-                output = torch.where(target_mask, temp, output)
-            return output
+                
+                # range_mask: (seq_len,) 表示哪些位置需要应用限制
+                # logits: (batch_size, seq_len, vocab_size)
+                for batch_idx in range(logits.shape[0]):
+                    for pos_idx in range(logits.shape[1]):
+                        if range_mask[pos_idx]:
+                            # 对这个位置，把不允许的token的logit设为-inf
+                            if lower is not None:
+                                logits[batch_idx, pos_idx, :lower] = -float('inf')
+                            if upper is not None:
+                                logits[batch_idx, pos_idx, upper+1:] = -float('inf')
+            
+            return logits
 
 
         assert max_new_tokens % block_length == 0
@@ -502,8 +508,12 @@ class MMadaModelLM(LLaDAModelLM):
                     logits = self(x_).logits
                     logits, un_logits = torch.chunk(logits, 2, dim=0)
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+                    # 应用logits mask，限制允许生成的token范围
+                    logits = apply_logits_mask(logits)
                 else:
                     logits = self(x, attention_bias=attention_bias).logits
+                    # 应用logits mask，限制允许生成的token范围
+                    logits = apply_logits_mask(logits)
                 
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
                 x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
@@ -516,10 +526,11 @@ class MMadaModelLM(LLaDAModelLM):
                 else:
                     raise NotImplementedError(remasking)
 
-                x0_p[:, idx.shape[1] + (num_block + 1) * block_length:] = -np.inf
+                # x0_p[:, idx.shape[1] + (num_block + 1) * block_length:] = -np.inf
+                x0_p[:, processed_clamp_ranges[2]:] = -np.inf
 
                 x0 = torch.where(mask_index, x0, x)
-                x0 = apply_clamp(x0, mask_index)
+                # 不再需要在token ID上clamp，因为已经在logits层面限制了
                 confidence = torch.where(mask_index, x0_p, -np.inf)
 
                 transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
@@ -593,25 +604,31 @@ class MMadaModelLM(LLaDAModelLM):
                     )
                 )
 
-        def apply_clamp(values, mask):
+        def apply_logits_mask(logits):
+            """
+            在logits层面进行masking，把不允许的token的logit设为-inf
+            这样在argmax时就不会采样到这些token
+            """
             if not processed_clamp_ranges:
-                return values
-            output = values
+                return logits
+            
             for start_idx, end_idx, lower, upper in processed_clamp_ranges:
                 range_mask = (clamp_position_ids >= start_idx) & (clamp_position_ids < end_idx)
                 if not torch.any(range_mask):
                     continue
-                range_mask = range_mask.unsqueeze(0).expand_as(values)
-                target_mask = mask & range_mask
-                if not torch.any(target_mask):
-                    continue
-                temp = output
-                if lower is not None:
-                    temp = torch.clamp(temp, min=lower)
-                if upper is not None:
-                    temp = torch.clamp(temp, max=upper)
-                output = torch.where(target_mask, temp, output)
-            return output
+                
+                # range_mask: (seq_len,) 表示哪些位置需要应用限制
+                # logits: (batch_size, seq_len, vocab_size)
+                for batch_idx in range(logits.shape[0]):
+                    for pos_idx in range(logits.shape[1]):
+                        if range_mask[pos_idx]:
+                            # 对这个位置，把不允许的token的logit设为-inf
+                            if lower is not None:
+                                logits[batch_idx, pos_idx, :lower] = -float('inf')
+                            if upper is not None:
+                                logits[batch_idx, pos_idx, upper+1:] = -float('inf')
+            
+            return logits
 
 
         assert max_new_tokens % block_length == 0
@@ -632,8 +649,12 @@ class MMadaModelLM(LLaDAModelLM):
                     logits = self(x_).logits
                     logits, un_logits = torch.chunk(logits, 2, dim=0)
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+                    # 应用logits mask，限制允许生成的token范围
+                    logits = apply_logits_mask(logits)
                 else:
                     logits = self(x, attention_bias=attention_bias).logits
+                    # 应用logits mask，限制允许生成的token范围
+                    logits = apply_logits_mask(logits)
                 
                 logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
                 x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
@@ -646,10 +667,11 @@ class MMadaModelLM(LLaDAModelLM):
                 else:
                     raise NotImplementedError(remasking)
 
-                x0_p[:, idx.shape[1] + (num_block + 1) * block_length:] = -np.inf
+                # x0_p[:, idx.shape[1] + (num_block + 1) * block_length:] = -np.inf
+                x0_p[:, processed_clamp_ranges[2]:] = -np.inf
 
                 x0 = torch.where(mask_index, x0, x)
-                x0 = apply_clamp(x0, mask_index)
+                # 不再需要在token ID上clamp，因为已经在logits层面限制了
                 confidence = torch.where(mask_index, x0_p, -np.inf)
 
                 transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
