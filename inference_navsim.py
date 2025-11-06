@@ -212,56 +212,106 @@ def inference_navsim_sample(
     ]
     expected_action_tokens = len(gt_action_token_ids)
     num_vq_tokens = config.model.mmada.num_vq_tokens
-    suffix_tokens = expected_action_tokens + 1 + 1 + num_vq_tokens + 1  # actions + <nav_future_sep> + <|soi|> + future + <|eoi|>
-    
+
     print(f"Expected action tokens: {expected_action_tokens}")
-    print(f"Total tokens to generate (actions + future + specials): {suffix_tokens}")
-    
-    if block_length is None or block_length <= 0 or suffix_tokens % block_length != 0:
-        if block_length not in (None, 0):
-            print(f"Adjusting block_length from {block_length} to {suffix_tokens} to fit suffix length.")
-        block_length = suffix_tokens
-    num_blocks = suffix_tokens // block_length
-    if decoding_steps % num_blocks != 0:
-        adjusted_steps = math.ceil(decoding_steps / num_blocks) * num_blocks
-        print(f"Adjusting decoding steps from {decoding_steps} to {adjusted_steps} to align with {num_blocks} block(s).")
-        decoding_steps = adjusted_steps
-    
+    print(f"Generating 16 action tokens followed by {num_vq_tokens} image tokens (fixed setup).")
+
+    def resolve_block_and_steps(max_tokens: int, block_hint: int | None):
+        block = block_hint
+        if block is None or block <= 0 or max_tokens % block != 0:
+            if block not in (None, 0):
+                print(f"Adjusting block_length from {block} to {max_tokens} to fit suffix length.")
+            block = max_tokens
+        num_blocks_local = max(1, max_tokens // block)
+        steps_local = decoding_steps
+        if steps_local % num_blocks_local != 0:
+            adjusted_steps = math.ceil(steps_local / num_blocks_local) * num_blocks_local
+            print(f"Adjusting decoding steps from {steps_local} to {adjusted_steps} to align with {num_blocks_local} block(s).")
+            steps_local = adjusted_steps
+        return block, steps_local
+
     mask_token_id = getattr(model.config, "mask_token_id", None)
     if mask_token_id is None:
         print("Warning: model.config.mask_token_id is None, defaulting to 126336.")
         mask_token_id = 126336
-    
-    generated_full = model.mmu_generate(
+
+    action_token_ids = [
+        uni_prompting.text_tokenizer.convert_tokens_to_ids(token)
+        for token in action_token_vocab()
+    ]
+    action_id_min = min(action_token_ids)
+    action_id_max = max(action_token_ids)
+    num_action_tokens = 16
+    if expected_action_tokens and expected_action_tokens != num_action_tokens:
+        print(
+            f"Warning: sample contains {expected_action_tokens} GT action tokens, "
+            f"but generation uses fixed length {num_action_tokens}."
+        )
+
+    action_start = input_ids.shape[1]
+    action_clamp_ranges = [
+        (
+            action_start,
+            action_start + num_action_tokens,
+            action_id_min,
+            action_id_max,
+        )
+    ]
+
+    action_block_length, action_steps = resolve_block_and_steps(num_action_tokens, block_length)
+    actions_full = model.mmu_generate(
         idx=input_ids,
-        max_new_tokens=suffix_tokens,
-        steps=decoding_steps,
-        block_length=block_length,
+        max_new_tokens=num_action_tokens,
+        steps=action_steps,
+        block_length=action_block_length,
         temperature=temperature,
         cfg_scale=cfg_scale,
         remasking=remasking,
         mask_id=mask_token_id,
+        clamp_ranges=action_clamp_ranges,
     )
-    
-    generated_suffix = generated_full[:, input_ids.shape[1]:]
-    generated_action_tokens = generated_suffix[0, :expected_action_tokens].tolist()
-    nav_future_sep_pred = generated_suffix[0, expected_action_tokens].item()
-    future_soi_pred = generated_suffix[0, expected_action_tokens + 1].item()
-    future_token_slice = generated_suffix[0, expected_action_tokens + 2:expected_action_tokens + 2 + num_vq_tokens]
-    future_eoi_pred = generated_suffix[0, expected_action_tokens + 2 + num_vq_tokens].item()
-    
-    nav_future_sep_id = uni_prompting.sptids_dict['<nav_future_sep>'].item()
-    soi_id = uni_prompting.sptids_dict['<|soi|>'].item()
-    eoi_id = uni_prompting.sptids_dict['<|eoi|>'].item()
-    
-    if nav_future_sep_pred != nav_future_sep_id:
-        print(f"Warning: expected <nav_future_sep> (id={nav_future_sep_id}) but got id={nav_future_sep_pred}.")
-    if future_soi_pred != soi_id:
-        print(f"Warning: expected future <|soi|> (id={soi_id}) but got id={future_soi_pred}.")
-    if future_eoi_pred != eoi_id:
-        print(f"Warning: expected future <|eoi|> (id={eoi_id}) but got id={future_eoi_pred}.")
-    
-    generated_future_tokens = (future_token_slice - token_offset).clamp(min=0, max=config.model.mmada.codebook_size - 1).tolist()
+
+    generated_actions_tensor = actions_full[:, action_start:action_start + num_action_tokens]
+    generated_action_tokens = generated_actions_tensor[0].tolist()
+
+    actions_prefix = torch.cat([input_ids, generated_actions_tensor], dim=1)
+
+    future_prefix = torch.cat([
+        actions_prefix,
+        future_sep_token,
+        soi_token,
+    ], dim=1)
+
+    vq_id_min = token_offset
+    vq_id_max = token_offset + config.model.mmada.codebook_size - 1
+
+    future_start = future_prefix.shape[1]
+    future_clamp_ranges = [
+        (
+            future_start,
+            future_start + num_vq_tokens,
+            vq_id_min,
+            vq_id_max,
+        )
+    ]
+
+    future_block_length, future_steps = resolve_block_and_steps(num_vq_tokens, block_length)
+    future_full = model.mmu_generate(
+        idx=future_prefix,
+        max_new_tokens=num_vq_tokens,
+        steps=future_steps,
+        block_length=future_block_length,
+        temperature=temperature,
+        cfg_scale=cfg_scale,
+        remasking=remasking,
+        mask_id=mask_token_id,
+        clamp_ranges=future_clamp_ranges,
+    )
+
+    future_token_slice = future_full[:, future_start:future_start + num_vq_tokens]
+    generated_future_tokens = (future_token_slice - token_offset).clamp(
+        min=0, max=config.model.mmada.codebook_size - 1
+    ).tolist()[0]
     
     # 6. 解码图像
     generated_future_tokens_tensor = torch.tensor(

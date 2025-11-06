@@ -418,7 +418,7 @@ class MMadaModelLM(LLaDAModelLM):
 
 
     @torch.no_grad()
-    def mmu_generate(self, idx=None, input_embeddings=None, max_new_tokens=128, steps=128,block_length=128, temperature=0.0, top_k=None, eot_token=None, cfg_scale=0.0, remasking='low_confidence', mask_id=126336, attention_mask=None):
+    def mmu_generate(self, idx=None, input_embeddings=None, max_new_tokens=128, steps=128, block_length=128, temperature=0.0, top_k=None, eot_token=None, cfg_scale=0.0, remasking='low_confidence', mask_id=126336, attention_mask=None, clamp_ranges=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -435,13 +435,51 @@ class MMadaModelLM(LLaDAModelLM):
         except:
             device = input_embeddings.device
 
-        result = []
         batch_size = idx.shape[0]
         x = torch.full((batch_size, idx.shape[1] + max_new_tokens), mask_id, dtype=torch.long).to(self.device)
         x[:, :idx.shape[1]] = idx.clone()
         prompt_index = (x != mask_id)
-        
-        
+
+        processed_clamp_ranges = []
+        clamp_position_ids = None
+        if clamp_ranges:
+            clamp_position_ids = torch.arange(x.shape[1], device=x.device)
+            for entry in clamp_ranges:
+                if len(entry) != 4:
+                    raise ValueError("Each clamp range must be a tuple of (start, end, min_id, max_id).")
+                start, end, min_id, max_id = entry
+                start_idx = 0 if start is None else int(start)
+                end_idx = x.shape[1] if end is None else int(end)
+                processed_clamp_ranges.append(
+                    (
+                        start_idx,
+                        end_idx,
+                        None if min_id is None else int(min_id),
+                        None if max_id is None else int(max_id),
+                    )
+                )
+
+        def apply_clamp(values, mask):
+            if not processed_clamp_ranges:
+                return values
+            output = values
+            for start_idx, end_idx, lower, upper in processed_clamp_ranges:
+                range_mask = (clamp_position_ids >= start_idx) & (clamp_position_ids < end_idx)
+                if not torch.any(range_mask):
+                    continue
+                range_mask = range_mask.unsqueeze(0).expand_as(values)
+                target_mask = mask & range_mask
+                if not torch.any(target_mask):
+                    continue
+                temp = output
+                if lower is not None:
+                    temp = torch.clamp(temp, min=lower)
+                if upper is not None:
+                    temp = torch.clamp(temp, max=upper)
+                output = torch.where(target_mask, temp, output)
+            return output
+
+
         assert max_new_tokens % block_length == 0
         num_blocks = max_new_tokens // block_length
 
@@ -481,6 +519,7 @@ class MMadaModelLM(LLaDAModelLM):
                 x0_p[:, idx.shape[1] + (num_block + 1) * block_length:] = -np.inf
 
                 x0 = torch.where(mask_index, x0, x)
+                x0 = apply_clamp(x0, mask_index)
                 confidence = torch.where(mask_index, x0_p, -np.inf)
 
                 transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
@@ -513,7 +552,7 @@ class MMadaModelLM(LLaDAModelLM):
         return x
 
     @torch.no_grad()
-    def mmu_generate_fast(self, idx=None, input_embeddings=None, max_new_tokens=128, steps=128,block_length=128, temperature=0.0, top_k=None, eot_token=None, cfg_scale=0.0, remasking='low_confidence', mask_id=126336, attention_mask=None):
+    def mmu_generate_fast(self, idx=None, input_embeddings=None, max_new_tokens=128, steps=128, block_length=128, temperature=0.0, top_k=None, eot_token=None, cfg_scale=0.0, remasking='low_confidence', mask_id=126336, attention_mask=None, clamp_ranges=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -530,13 +569,51 @@ class MMadaModelLM(LLaDAModelLM):
         except:
             device = input_embeddings.device
 
-        result = []
         batch_size = idx.shape[0]
         x = torch.full((batch_size, idx.shape[1] + max_new_tokens), mask_id, dtype=torch.long).to(self.device)
         x[:, :idx.shape[1]] = idx.clone()
         prompt_index = (x != mask_id)
-        
-        
+
+        processed_clamp_ranges = []
+        clamp_position_ids = None
+        if clamp_ranges:
+            clamp_position_ids = torch.arange(x.shape[1], device=x.device)
+            for entry in clamp_ranges:
+                if len(entry) != 4:
+                    raise ValueError("Each clamp range must be a tuple of (start, end, min_id, max_id).")
+                start, end, min_id, max_id = entry
+                start_idx = 0 if start is None else int(start)
+                end_idx = x.shape[1] if end is None else int(end)
+                processed_clamp_ranges.append(
+                    (
+                        start_idx,
+                        end_idx,
+                        None if min_id is None else int(min_id),
+                        None if max_id is None else int(max_id),
+                    )
+                )
+
+        def apply_clamp(values, mask):
+            if not processed_clamp_ranges:
+                return values
+            output = values
+            for start_idx, end_idx, lower, upper in processed_clamp_ranges:
+                range_mask = (clamp_position_ids >= start_idx) & (clamp_position_ids < end_idx)
+                if not torch.any(range_mask):
+                    continue
+                range_mask = range_mask.unsqueeze(0).expand_as(values)
+                target_mask = mask & range_mask
+                if not torch.any(target_mask):
+                    continue
+                temp = output
+                if lower is not None:
+                    temp = torch.clamp(temp, min=lower)
+                if upper is not None:
+                    temp = torch.clamp(temp, max=upper)
+                output = torch.where(target_mask, temp, output)
+            return output
+
+
         assert max_new_tokens % block_length == 0
         num_blocks = max_new_tokens // block_length
 
@@ -572,6 +649,7 @@ class MMadaModelLM(LLaDAModelLM):
                 x0_p[:, idx.shape[1] + (num_block + 1) * block_length:] = -np.inf
 
                 x0 = torch.where(mask_index, x0, x)
+                x0 = apply_clamp(x0, mask_index)
                 confidence = torch.where(mask_index, x0_p, -np.inf)
 
                 transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
