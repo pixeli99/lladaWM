@@ -444,11 +444,11 @@ class MMadaModelLM(LLaDAModelLM):
         clamp_position_ids = None
 
         attention_bias = torch.ones(
-            idx.shape[0],
+            x.shape[0],
             1,
-            idx.shape[1],
-            idx.shape[1],
-            device=idx.device,
+            x.shape[1],
+            x.shape[1],
+            device=x.device,
             dtype=torch.bool,
         )
         if clamp_ranges:
