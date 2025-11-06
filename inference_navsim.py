@@ -303,12 +303,12 @@ def inference_navsim_sample(
         device=device, 
         dtype=torch.long
     )
-    pred_future_image = vq_model.decode_code(generated_future_tokens_tensor)
+    pred_future_image = vq_model.decode_code(generated_future_tokens_tensor[:, :128], shape=(8, 16))
     
     # 解码GT未来图像
     gt_future_front = sample["future_front_image"].unsqueeze(0).to(device)
-    # gt_future_tokens = vq_model.get_code(gt_future_front).long()
-    # recon_gt_future = vq_model.decode_code(gt_future_tokens)
+    gt_future_tokens = vq_model.get_code(gt_future_front).long()
+    recon_gt_future = vq_model.decode_code(gt_future_tokens, shape=(8, 16))
     
     return {
         'generated_action_tokens': generated_action_tokens,
@@ -316,7 +316,7 @@ def inference_navsim_sample(
         'gt_action_token_ids': gt_action_token_ids,
         'pred_future_image': pred_future_image,
         'gt_future_image': gt_future_front,
-        # 'recon_gt_future': recon_gt_future,
+        'recon_gt_future': recon_gt_future,
         'history_images': history_front,
         'prompt_text': prompt_text,
     }
@@ -392,7 +392,7 @@ def visualize_results(results, uni_prompting, save_path="navsim_inference_result
     # 准备未来帧
     gt_future_img = tensor_to_image(results['gt_future_image'])
     pred_future_img = tensor_to_image(results['pred_future_image'])
-    # recon_gt_img = tensor_to_image(results['recon_gt_future'])
+    recon_gt_img = tensor_to_image(results['recon_gt_future'])
     
     # 创建可视化
     fig, axes = plt.subplots(2, num_hist + 1, figsize=(4 * (num_hist + 1), 8))

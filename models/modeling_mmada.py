@@ -435,6 +435,14 @@ class MMadaModelLM(LLaDAModelLM):
         except:
             device = input_embeddings.device
 
+        attention_bias = torch.ones(
+            idx.shape[0],
+            1,
+            idx.shape[1],
+            idx.shape[1],
+            device=idx.device,
+            dtype=torch.bool,
+        )
         batch_size = idx.shape[0]
         x = torch.full((batch_size, idx.shape[1] + max_new_tokens), mask_id, dtype=torch.long).to(self.device)
         x[:, :idx.shape[1]] = idx.clone()
