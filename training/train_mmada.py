@@ -573,7 +573,7 @@ def main():
         return noisy_batch, labels_lm, p_mask
     
     @torch.no_grad()
-    def prepare_inputs_and_labels_for_navsim(navsim_batch):
+    def prepare_inputs_and_labels_for_navsim(navsim_batch, eps=1e-3):
         history_front = navsim_batch["history_front_images"].to(accelerator.device, non_blocking=True)
         bsz, num_hist, channels, height, width = history_front.shape
         history_flat = history_front.reshape(bsz * num_hist, channels, height, width)
@@ -610,11 +610,27 @@ def main():
             action_token_ids.append(torch.tensor(ids, dtype=torch.long, device=accelerator.device))
         action_token_tensor = torch.stack(action_token_ids, dim=0)
 
-        input_ids_navsim, _, labels_navsim = uni_prompting(
+        input_ids_navsim, prompt_masks, labels_navsim = uni_prompting(
             (history_tensor.long(), navsim_batch["prompt_text"], action_token_tensor, future_tokens.long()),
             'navsim'
         )
-        return input_ids_navsim, labels_navsim
+        
+        # Add masking similar to prepare_inputs_and_labels_for_text
+        b, l = input_ids_navsim.shape
+        t = torch.rand(b, device=input_ids_navsim.device)
+        p_mask = (1 - eps) * t + eps
+        p_mask = p_mask[:, None].repeat(1, l)
+
+        masked_indices = torch.rand((b, l), device=input_ids_navsim.device) < p_mask
+        # Replace tokens with mask_id
+        noisy_batch = torch.where(masked_indices, mask_id, input_ids_navsim)
+        masked_indices = noisy_batch == mask_id
+        
+        # Keep prompt part unchanged (similar to prepare_inputs_and_labels_for_mmu)
+        noisy_batch[prompt_masks.bool()] = input_ids_navsim[prompt_masks.bool()]
+        masked_indices = noisy_batch == mask_id
+        
+        return noisy_batch, labels_navsim, p_mask
 
     @torch.no_grad()
     def prepare_inputs_and_labels_for_mmu(
@@ -650,7 +666,7 @@ def main():
             model.train()
             for navsim_batch in navsim_loader:
                 data_time_m.update(time.time() - end_local)
-                input_ids_navsim, labels_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
+                input_ids_navsim, labels_navsim, p_mask_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
                 batch_size_navsim = input_ids_navsim.shape[0]
 
                 with accelerator.accumulate(model):
@@ -664,6 +680,7 @@ def main():
                         max_seq_length=config.dataset.preprocessing.max_seq_length,
                         p_mask_lm=None,
                         p_mask_mmu=None,
+                        p_mask_navsim=p_mask_navsim,
                         answer_lengths=None,
                         t2i_masks=None,
                     )
@@ -827,9 +844,10 @@ def main():
             input_ids = torch.cat((input_ids, input_ids_mmu.to(input_ids.device)), dim=0)
             labels = torch.cat((labels, labels_mmu.to(input_ids.device)), dim=0)
 
+            p_mask_navsim = None
             if navsim_enabled:
                 navsim_batch = batch["navsim_flow"]
-                input_ids_navsim, labels_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
+                input_ids_navsim, labels_navsim, p_mask_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
                 batch_size_navsim = input_ids_navsim.shape[0]
                 input_ids = torch.cat((input_ids, input_ids_navsim.to(input_ids.device)), dim=0)
                 labels = torch.cat((labels, labels_navsim.to(input_ids.device)), dim=0)
@@ -848,7 +866,8 @@ def main():
                     batch_size_navsim=batch_size_navsim,
                     max_seq_length=config.dataset.preprocessing.max_seq_length,
                     p_mask_lm=p_mask_lm,
-                    p_mask_mmu=p_mask_mmu,  
+                    p_mask_mmu=p_mask_mmu,
+                    p_mask_navsim=p_mask_navsim,
                     answer_lengths=answer_lengths,
                     t2i_masks=t2i_masks
                 )

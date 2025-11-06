@@ -221,6 +221,7 @@ class MMadaModelLM(LLaDAModelLM):
             max_seq_length=128,
             p_mask_lm=None,
             p_mask_mmu=None,
+            p_mask_navsim=None,
             answer_lengths=None,
             t2i_masks=None,
             answer_lengths_lm=None
@@ -287,9 +288,14 @@ class MMadaModelLM(LLaDAModelLM):
         if batch_size_navsim == 0:
             loss_navsim = torch.tensor(0.0, device=input_ids.device)
         else:
-            navsim_logits = logits[start_navsim:end_navsim].reshape(-1, self.output_size)
-            navsim_labels = labels[start_navsim:end_navsim].reshape(-1)
-            loss_navsim = F.cross_entropy(navsim_logits, navsim_labels, ignore_index=-100)
+            masked_indices_navsim = masked_indices[start_navsim:end_navsim]
+            p_mask_navsim = p_mask_navsim.to(masked_indices_navsim.device)
+            loss_navsim = F.cross_entropy(
+                logits[start_navsim:end_navsim][masked_indices_navsim].contiguous().view(-1, self.output_size),
+                labels[start_navsim:end_navsim][masked_indices_navsim].contiguous().view(-1), ignore_index=-100, reduction='none'
+                )/p_mask_navsim[masked_indices_navsim]
+            denom = max(1, logits[start_navsim:end_navsim].shape[0] * logits[start_navsim:end_navsim].shape[1])
+            loss_navsim = loss_navsim.sum() / denom
         
         return logits, loss_t2i, loss_lm, loss_mmu, loss_navsim
 
