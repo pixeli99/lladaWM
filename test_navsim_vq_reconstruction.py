@@ -18,6 +18,12 @@ from torchvision import transforms
 
 from models import MAGVITv2
 from training.navsim_data.navsim_mmada_dataset import create_navsim_mmada_dataloader
+from vision_tokenizer import build_vision_tokenizer
+
+MODEL_DISPLAY_NAMES = {
+    "magvit": "MAGVITv2",
+    "vision_tokenizer": "Vision Tokenizer",
+}
 
 
 def load_vq_model(vq_model_path, device="cuda"):
@@ -66,7 +72,14 @@ def denormalize_image(tensor):
     return (img * 255).astype(np.uint8)
 
 
-def reconstruct_at_resolution(vq_model, image_pil, resolution, device="cuda"):
+def reconstruct_at_resolution(
+    vq_model,
+    image_pil,
+    resolution,
+    device="cuda",
+    vision_tokenizer=None,
+    vision_tokenizer_device=None,
+):
     """
     在指定分辨率下进行 VQ-VAE 重建
     Args:
@@ -74,45 +87,56 @@ def reconstruct_at_resolution(vq_model, image_pil, resolution, device="cuda"):
         image_pil: PIL Image (原始图像)
         resolution: int, 目标分辨率的高度（宽度为高度的2倍）
         device: str
+        vision_tokenizer: optional vision tokenizer model
+        vision_tokenizer_device: device for the vision tokenizer
     Returns:
-        dict: {
-            'original': numpy array,
-            'reconstructed': numpy array,
-            'codes': tensor,
-            'num_tokens': int
-        }
+        dict: {model_name: result_dict}
     """
-    # Resize 和归一化
-    img_tensor = resize_and_normalize(image_pil, resolution).to(device)
+    results = {}
+    # Resize 和归一化（保持 CPU，用于多个模型）
+    base_tensor = resize_and_normalize(image_pil, resolution)
+    original_np = denormalize_image(base_tensor.cpu())
     
-    # 编码
+    # 编码（MAGVIT）
+    img_tensor = base_tensor.to(device)
     with torch.no_grad():
         codes = vq_model.get_code(img_tensor)
         num_tokens = codes.shape[1]
         
-        # 计算编码后的 feature map shape (假设下采样因子为16)
-        # 原始图像: (resolution, resolution*2)
-        # 编码后: (resolution//16, resolution*2//16)
         downsample_factor = 16
         latent_h = resolution // downsample_factor
         latent_w = (resolution * 2) // downsample_factor
-        
-        # 解码时需要提供 shape
         reconstructed = vq_model.decode_code(codes, shape=(latent_h, latent_w))
     
-    # 转换为可视化的图像
-    original_np = denormalize_image(img_tensor.cpu())
-    reconstructed_np = denormalize_image(reconstructed.cpu())
-    
-    return {
+    results["magvit"] = {
         'original': original_np,
-        'reconstructed': reconstructed_np,
+        'reconstructed': denormalize_image(reconstructed.cpu()),
         'codes': codes,
         'num_tokens': num_tokens
     }
+    
+    if vision_tokenizer is not None:
+        vt_device = vision_tokenizer_device or device
+        vt_tensor = base_tensor.to(vt_device)
+        with torch.no_grad():
+            quant, _, info = vision_tokenizer.encode(vt_tensor)
+            vt_codes = info[-1].view(vt_tensor.shape[0], -1).long()
+            latent_h, latent_w = quant.shape[2], quant.shape[3]
+            vt_shape = (vt_tensor.shape[0], latent_h, latent_w, quant.shape[1])
+            reconstructed_vt = vision_tokenizer.decode_code(vt_codes, shape=vt_shape)
+        
+        results["vision_tokenizer"] = {
+            'original': original_np,
+            'reconstructed': denormalize_image(reconstructed_vt.cpu()),
+            'codes': vt_codes,
+            'num_tokens': vt_codes.shape[1],
+            'latent_shape': (latent_h, latent_w),
+        }
+    
+    return results
 
 
-def visualize_multi_resolution_reconstruction(results_dict, save_path):
+def visualize_multi_resolution_reconstruction(results_dict, save_path, model_order):
     """
     可视化多个分辨率的重建结果
     Args:
@@ -121,31 +145,30 @@ def visualize_multi_resolution_reconstruction(results_dict, save_path):
     """
     resolutions = sorted(results_dict.keys())
     num_res = len(resolutions)
+    num_rows = 1 + len(model_order)
     
-    fig, axes = plt.subplots(2, num_res, figsize=(5 * num_res, 10))
-    
+    fig, axes = plt.subplots(num_rows, num_res, figsize=(5 * num_res, 4 * num_rows))
     if num_res == 1:
-        axes = axes.reshape(2, 1)
+        axes = np.array(axes).reshape(num_rows, 1)
     
-    for idx, res in enumerate(resolutions):
-        result = results_dict[res]
+    for col, res in enumerate(resolutions):
         width = res * 2
+        first_model = results_dict[res][model_order[0]]
+        axes[0, col].imshow(first_model['original'])
+        axes[0, col].set_title(f'Original\n{res}x{width}', fontsize=14, fontweight='bold')
+        axes[0, col].axis('off')
         
-        # 第一行：原图
-        axes[0, idx].imshow(result['original'])
-        axes[0, idx].set_title(f'Original\n{res}x{width}', fontsize=14, fontweight='bold')
-        axes[0, idx].axis('off')
-        
-        # 第二行：重建图
-        axes[1, idx].imshow(result['reconstructed'])
-        axes[1, idx].set_title(
-            f'Reconstructed\n{res}x{width}\n{result["num_tokens"]} tokens',
-            fontsize=14,
-            fontweight='bold'
-        )
-        axes[1, idx].axis('off')
+        for row_idx, model_name in enumerate(model_order, start=1):
+            result = results_dict[res][model_name]
+            axes[row_idx, col].imshow(result['reconstructed'])
+            axes[row_idx, col].set_title(
+                f'{MODEL_DISPLAY_NAMES.get(model_name, model_name)}\n{res}x{width}\n{result["num_tokens"]} tokens',
+                fontsize=12,
+                fontweight='bold'
+            )
+            axes[row_idx, col].axis('off')
     
-    plt.suptitle('VQ-VAE Reconstruction at Different Resolutions', fontsize=16, fontweight='bold')
+    plt.suptitle('VQ Reconstruction at Different Resolutions', fontsize=16, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"\nVisualization saved to: {save_path}")
@@ -207,10 +230,29 @@ def main():
                        help="Output visualization path")
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device to use")
+    parser.add_argument("--vision_tokenizer_path", type=str, default=None,
+                       help="Path to vision tokenizer directory (expects config.yaml & model.ckpt)")
+    parser.add_argument("--vision_tokenizer_type", type=str, default="ibq",
+                       help="Vision tokenizer type (default: ibq)")
+    parser.add_argument("--vision_tokenizer_device", type=str, default=None,
+                       help="Device for the vision tokenizer (defaults to --device)")
     
     args = parser.parse_args()
     
     device = args.device
+    vision_tokenizer_device = args.vision_tokenizer_device or device
+    
+    vision_tokenizer = None
+    if args.vision_tokenizer_path is not None:
+        print(f"\nLoading vision tokenizer from {args.vision_tokenizer_path} ({args.vision_tokenizer_type})...")
+        vision_tokenizer = build_vision_tokenizer(
+            type=args.vision_tokenizer_type,
+            model_path=args.vision_tokenizer_path,
+            device=vision_tokenizer_device,
+        )
+        vision_tokenizer.eval()
+        vision_tokenizer.requires_grad_(False)
+        print("Vision tokenizer loaded successfully!")
     
     # 1. 加载 VQ-VAE 模型
     vq_model = load_vq_model(args.vq_model_path, device=device)
@@ -252,6 +294,10 @@ def main():
     
     # 4. 测试不同分辨率
     results_dict = {}
+    model_order = ["magvit"]
+    if vision_tokenizer is not None:
+        model_order.append("vision_tokenizer")
+    
     print("\n" + "="*80)
     print("Testing reconstructions at different resolutions (1:2 aspect ratio):")
     print("="*80)
@@ -259,36 +305,54 @@ def main():
     for resolution in args.resolutions:
         width = resolution * 2
         print(f"\nResolution: {resolution}x{width}")
-        result = reconstruct_at_resolution(vq_model, first_image_pil, resolution, device)
-        results_dict[resolution] = result
+        per_model_results = reconstruct_at_resolution(
+            vq_model,
+            first_image_pil,
+            resolution,
+            device,
+            vision_tokenizer=vision_tokenizer,
+            vision_tokenizer_device=vision_tokenizer_device,
+        )
+        results_dict[resolution] = per_model_results
         
         # 计算指标
-        metrics = compute_metrics(result['original'], result['reconstructed'])
-        print(f"  Tokens: {result['num_tokens']}")
-        print(f"  MSE:  {metrics['MSE']:.2f}")
-        print(f"  PSNR: {metrics['PSNR']:.2f} dB")
-        print(f"  MAE:  {metrics['MAE']:.2f}")
+        for model_name in model_order:
+            if model_name not in per_model_results:
+                continue
+            display_name = MODEL_DISPLAY_NAMES.get(model_name, model_name)
+            metrics = compute_metrics(
+                per_model_results[model_name]['original'],
+                per_model_results[model_name]['reconstructed']
+            )
+            print(f"  {display_name}:")
+            print(f"    Tokens: {per_model_results[model_name]['num_tokens']}")
+            print(f"    MSE:  {metrics['MSE']:.2f}")
+            print(f"    PSNR: {metrics['PSNR']:.2f} dB")
+            print(f"    MAE:  {metrics['MAE']:.2f}")
     
     # 5. 可视化
     print("\n" + "="*80)
     print("Creating visualization...")
-    visualize_multi_resolution_reconstruction(results_dict, args.output)
+    visualize_multi_resolution_reconstruction(results_dict, args.output, model_order)
     
     # 6. 打印总结
     print("\n" + "="*80)
     print("SUMMARY:")
     print("="*80)
-    print(f"{'Resolution':<15} {'Tokens':<10} {'MSE':<12} {'PSNR (dB)':<12} {'MAE':<10}")
+    print(f"{'Resolution':<15} {'Model':<18} {'Tokens':<10} {'MSE':<12} {'PSNR (dB)':<12} {'MAE':<10}")
     print("-" * 80)
     for resolution in args.resolutions:
-        result = results_dict[resolution]
-        metrics = compute_metrics(result['original'], result['reconstructed'])
         width = resolution * 2
-        print(f"{resolution}x{width:<8} {result['num_tokens']:<10} "
-              f"{metrics['MSE']:<12.2f} {metrics['PSNR']:<12.2f} {metrics['MAE']:<10.2f}")
+        for model_name in model_order:
+            if model_name not in results_dict[resolution]:
+                continue
+            result = results_dict[resolution][model_name]
+            metrics = compute_metrics(result['original'], result['reconstructed'])
+            display_name = MODEL_DISPLAY_NAMES.get(model_name, model_name)
+            print(f"{resolution}x{width:<8} {display_name:<18} {result['num_tokens']:<10} "
+                  f"{metrics['MSE']:<12.2f} {metrics['PSNR']:<12.2f} {metrics['MAE']:<10.2f}")
     print("="*80)
 
 
 if __name__ == "__main__":
     main()
-
