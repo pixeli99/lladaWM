@@ -229,8 +229,6 @@ def inference_navsim_sample(
     ]
     expected_action_tokens = len(gt_action_token_ids)
 
-    print(f"Expected action tokens: {expected_action_tokens}")
-    print(f"Generating {num_action_tokens} action tokens, then {num_future_tokens} future image tokens via mask decoding.")
 
     mask_token_id = getattr(model.config, "mask_token_id", None)
     if mask_token_id is None:
@@ -393,8 +391,13 @@ def visualize_results(results, uni_prompting, save_path="navsim_inference_result
     print(f"{'='*80}")
     
     def tensor_to_image(tensor):
-        """将tensor转换为numpy图像"""
+        """
+        将tensor转换为numpy图像
+        输入范围应该是 [-1, 1] (经过 Normalize(mean=0.5, std=0.5) 的图像)
+        输出范围是 [0, 255] 的 uint8 numpy数组
+        """
         img = tensor.squeeze(0).cpu()
+        # 从 [-1, 1] 转换到 [0, 1]
         img = torch.clamp((img + 1.0) / 2.0, 0.0, 1.0)
         img = img.permute(1, 2, 0).numpy()
         return (img * 255).astype(np.uint8)

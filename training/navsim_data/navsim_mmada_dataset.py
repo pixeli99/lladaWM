@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from PIL import Image
 
 from .action_tokens import status_to_bev_tokens, trajectory_to_bev_tokens
 from .navsim_online_dataset import NavsimOnlineDataset
@@ -15,6 +17,14 @@ from .navsim_online_dataset import NavsimOnlineDataset
 class NavsimSampleTransforms:
     include_stitched: bool = True
     include_front: bool = True
+
+
+def _default_navsim_image_transform() -> Callable[[Image.Image], torch.Tensor]:
+    """Default image transform with normalization to [-1, 1] range."""
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
 
 
 def _format_velocity(vec: torch.Tensor) -> str:
@@ -49,9 +59,18 @@ class NavsimMMaDADataset(Dataset):
         target_future_seconds: float = 4.0,
         stitched_image_size: Tuple[int, int] = (1024, 256),
         front_image_size: Tuple[int, int] = (256, 128),
+        history_image_transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
+        future_image_transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
     ) -> None:
         super().__init__()
         tfm = transforms or NavsimSampleTransforms()
+        
+        # Use provided transforms or default normalized transforms
+        if history_image_transform is None:
+            history_image_transform = _default_navsim_image_transform()
+        if future_image_transform is None:
+            future_image_transform = _default_navsim_image_transform()
+        
         self.dataset = NavsimOnlineDataset(
             json_path=json_path,
             navsim_log_path=navsim_log_path,
@@ -63,6 +82,8 @@ class NavsimMMaDADataset(Dataset):
             target_future_seconds=target_future_seconds,
             stitched_image_size=stitched_image_size,
             front_image_size=front_image_size,
+            history_image_transform=history_image_transform,
+            future_image_transform=future_image_transform,
         )
         self.target_future_seconds = target_future_seconds
 
