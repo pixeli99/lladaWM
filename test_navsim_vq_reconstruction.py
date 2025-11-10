@@ -35,12 +35,14 @@ def resize_and_normalize(image_pil, resolution):
     将 PIL 图像 resize 到指定分辨率并归一化
     Args:
         image_pil: PIL Image
-        resolution: int, 目标分辨率（正方形）
+        resolution: int, 目标分辨率的高度（宽度为高度的2倍，比例1:2）
     Returns:
         torch.Tensor: [1, 3, H, W], 范围 [-1, 1]
     """
+    height = resolution
+    width = resolution * 2
     transform = transforms.Compose([
-        transforms.Resize((resolution, resolution), interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.Resize((height, width), interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
@@ -70,7 +72,7 @@ def reconstruct_at_resolution(vq_model, image_pil, resolution, device="cuda"):
     Args:
         vq_model: VQ-VAE 模型
         image_pil: PIL Image (原始图像)
-        resolution: int, 目标分辨率
+        resolution: int, 目标分辨率的高度（宽度为高度的2倍）
         device: str
     Returns:
         dict: {
@@ -88,8 +90,15 @@ def reconstruct_at_resolution(vq_model, image_pil, resolution, device="cuda"):
         codes = vq_model.get_code(img_tensor)
         num_tokens = codes.shape[1]
         
-        # 解码
-        reconstructed = vq_model.decode_code(codes)
+        # 计算编码后的 feature map shape (假设下采样因子为16)
+        # 原始图像: (resolution, resolution*2)
+        # 编码后: (resolution//16, resolution*2//16)
+        downsample_factor = 16
+        latent_h = resolution // downsample_factor
+        latent_w = (resolution * 2) // downsample_factor
+        
+        # 解码时需要提供 shape
+        reconstructed = vq_model.decode_code(codes, shape=(latent_h, latent_w))
     
     # 转换为可视化的图像
     original_np = denormalize_image(img_tensor.cpu())
@@ -120,16 +129,17 @@ def visualize_multi_resolution_reconstruction(results_dict, save_path):
     
     for idx, res in enumerate(resolutions):
         result = results_dict[res]
+        width = res * 2
         
         # 第一行：原图
         axes[0, idx].imshow(result['original'])
-        axes[0, idx].set_title(f'Original\n{res}x{res}', fontsize=14, fontweight='bold')
+        axes[0, idx].set_title(f'Original\n{res}x{width}', fontsize=14, fontweight='bold')
         axes[0, idx].axis('off')
         
         # 第二行：重建图
         axes[1, idx].imshow(result['reconstructed'])
         axes[1, idx].set_title(
-            f'Reconstructed\n{res}x{res}\n{result["num_tokens"]} tokens',
+            f'Reconstructed\n{res}x{width}\n{result["num_tokens"]} tokens',
             fontsize=14,
             fontweight='bold'
         )
@@ -243,11 +253,12 @@ def main():
     # 4. 测试不同分辨率
     results_dict = {}
     print("\n" + "="*80)
-    print("Testing reconstructions at different resolutions:")
+    print("Testing reconstructions at different resolutions (1:2 aspect ratio):")
     print("="*80)
     
     for resolution in args.resolutions:
-        print(f"\nResolution: {resolution}x{resolution}")
+        width = resolution * 2
+        print(f"\nResolution: {resolution}x{width}")
         result = reconstruct_at_resolution(vq_model, first_image_pil, resolution, device)
         results_dict[resolution] = result
         
@@ -272,7 +283,8 @@ def main():
     for resolution in args.resolutions:
         result = results_dict[resolution]
         metrics = compute_metrics(result['original'], result['reconstructed'])
-        print(f"{resolution}x{resolution:<8} {result['num_tokens']:<10} "
+        width = resolution * 2
+        print(f"{resolution}x{width:<8} {result['num_tokens']:<10} "
               f"{metrics['MSE']:<12.2f} {metrics['PSNR']:<12.2f} {metrics['MAE']:<10.2f}")
     print("="*80)
 
