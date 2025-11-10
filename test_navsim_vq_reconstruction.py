@@ -176,7 +176,7 @@ def main():
     
     # 默认路径配置
     DEFAULT_VQ_MODEL_PATH = "/lpai/volumes/ad-vla-vol-ga/lipengxiang/hf_model/magvit2"
-    DEFAULT_JSON_PATH = "/lpai/volumes/ad-vla-vol-ga/lipengxiang/code/github_code_backup/lladaWM/demo.json1"
+    DEFAULT_JSON_PATH = "/lpai/volumes/ad-vla-vol-ga/lipengxiang/code/github_code_backup/lladaWM/demo.jsonl"
     DEFAULT_NAVSIM_LOG_PATH = "/lpai/dataset/navsim-unzip/0-1-0/navsim_workspace/trainval_navsim_logs/trainval"
     DEFAULT_SENSOR_BLOBS_PATH = "/lpai/dataset/navsim-unzip/0-1-0/navsim_workspace/trainval_sensor_blobs/trainval"
     
