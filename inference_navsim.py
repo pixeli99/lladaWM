@@ -16,7 +16,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 from transformers import AutoTokenizer
-from models import MAGVITv2, MMadaModelLM, MMadaConfig
+from models import MAGVITv2, MMadaModelLM, MMadaConfig, get_mask_schedule
 from training.prompting_utils import UniversalPrompting
 from training.navsim_data.navsim_mmada_dataset import create_navsim_mmada_dataloader
 from training.navsim_data.action_tokens import action_token_vocab
@@ -141,6 +141,24 @@ def inference_navsim_sample(
     bsz, num_hist, channels, height, width = history_front.shape
     history_flat = history_front.reshape(bsz * num_hist, channels, height, width)
     token_offset = len(uni_prompting.text_tokenizer)
+
+    gt_future_front = sample["future_front_image"].unsqueeze(0).to(device)
+    gt_future_tokens = vq_model.get_code(gt_future_front).long()
+    num_future_tokens = gt_future_tokens.shape[1]
+    height_px = float(sample["future_front_image"].shape[-2])
+    width_px = float(sample["future_front_image"].shape[-1])
+    aspect_ratio = width_px / max(1.0, height_px)
+    approx_height = max(1, int(round(math.sqrt(num_future_tokens / max(aspect_ratio, 1e-6)))))
+    approx_width = max(1, int(math.ceil(num_future_tokens / approx_height)))
+    while approx_height * approx_width > num_future_tokens and approx_height > 1:
+        approx_height -= 1
+        approx_width = max(1, int(math.ceil(num_future_tokens / approx_height)))
+    if approx_height * approx_width != num_future_tokens:
+        approx_width = max(1, num_future_tokens // approx_height)
+    if approx_height * approx_width != num_future_tokens:
+        approx_height = 1
+        approx_width = num_future_tokens
+    future_token_shape = (approx_height, approx_width)
     
     # 编码历史帧为tokens
     history_codes = vq_model.get_code(history_flat).long() + token_offset
@@ -172,7 +190,6 @@ def inference_navsim_sample(
     soi_token = uni_prompting.sptids_dict['<|soi|>'].to(device).long().view(1, 1)
     eoi_token = uni_prompting.sptids_dict['<|eoi|>'].to(device).long().view(1, 1)
     action_sep_token = uni_prompting.sptids_dict['<nav_action_sep>'].to(device).long().view(1, 1)
-    future_sep_token = uni_prompting.sptids_dict['<nav_future_sep>'].to(device).long().view(1, 1)
     
     # 编码prompt text，遵循训练时的padding/truncation方式
     prompt_text = sample["prompt_text"]
@@ -211,10 +228,9 @@ def inference_navsim_sample(
         uni_prompting.text_tokenizer.convert_tokens_to_ids(token) for token in gt_action_tokens
     ]
     expected_action_tokens = len(gt_action_token_ids)
-    num_vq_tokens = config.model.mmada.num_vq_tokens
 
     print(f"Expected action tokens: {expected_action_tokens}")
-    print(f"Generating 16 action tokens followed by {num_vq_tokens} image tokens (fixed setup).")
+    print(f"Generating {num_action_tokens} action tokens, then {num_future_tokens} future image tokens via mask decoding.")
 
     mask_token_id = getattr(model.config, "mask_token_id", None)
     if mask_token_id is None:
@@ -259,56 +275,57 @@ def inference_navsim_sample(
     generated_actions_tensor = actions_full[:, action_start:action_start + num_action_tokens]
     generated_action_tokens = generated_actions_tensor[0].tolist()
 
-    actions_prefix = torch.cat([input_ids, generated_actions_tensor], dim=1)
+    masked_future_tokens = torch.full(
+        (history_tensor.shape[0], num_future_tokens),
+        mask_token_id,
+        dtype=torch.long,
+        device=device,
+    )
 
-    future_prefix = torch.cat([
-        actions_prefix,
-        future_sep_token,
-        soi_token,
-    ], dim=1)
+    navsim_inputs, _, _ = uni_prompting(
+        (history_tensor.long(), [prompt_text], generated_actions_tensor.long(), masked_future_tokens),
+        'navsim'
+    )
+    attention_mask = torch.ones_like(navsim_inputs, dtype=torch.long, device=device)
 
-    vq_id_min = token_offset
-    vq_id_max = token_offset + config.model.mmada.codebook_size - 1
-
-    future_start = future_prefix.shape[1]
-    future_clamp_ranges = [
-        (
-            future_start,
-            future_start + num_vq_tokens,
-            vq_id_min,
-            vq_id_max,
+    if cfg_scale > 0:
+        blank_prompts = [""] * navsim_inputs.shape[0]
+        uncond_inputs, _, _ = uni_prompting(
+            (history_tensor.long(), blank_prompts, generated_actions_tensor.long(), masked_future_tokens.clone()),
+            'navsim'
         )
-    ]
+        uncond_attention_mask = torch.ones_like(uncond_inputs, dtype=torch.long, device=device)
+    else:
+        uncond_inputs = None
+        uncond_attention_mask = None
 
-    future_full = model.mmu_generate(
-        idx=future_prefix,
-        max_new_tokens=129,
-        steps=129,
-        block_length=129,
-        temperature=temperature,
-        cfg_scale=cfg_scale,
-        remasking=remasking,
-        mask_id=mask_token_id,
-        clamp_ranges=future_clamp_ranges,
-    )
+    if config.get("mask_schedule", None):
+        schedule = config.mask_schedule.schedule
+        schedule_params = config.mask_schedule.get("params", {})
+        mask_schedule = get_mask_schedule(schedule, **schedule_params)
+    else:
+        mask_schedule = get_mask_schedule(config.training.get("mask_schedule", "cosine"))
 
-    future_token_slice = future_full[:, future_start:future_start + num_vq_tokens]
-    generated_future_tokens = (future_token_slice - token_offset).clamp(
-        min=0, max=config.model.mmada.codebook_size - 1
-    ).tolist()[0]
-    
-    # 6. 解码图像
-    generated_future_tokens_tensor = torch.tensor(
-        [generated_future_tokens], 
-        device=device, 
-        dtype=torch.long
+    future_generation_steps = max(1, decoding_steps if decoding_steps is not None else config.training.get("generation_timesteps", 12))
+    generation_temperature = temperature if temperature is not None else config.training.get("generation_temperature", 1.0)
+    gen_future_codes = model.t2i_generate(
+        input_ids=navsim_inputs.clone(),
+        uncond_input_ids=uncond_inputs,
+        attention_mask=attention_mask,
+        uncond_attention_mask=uncond_attention_mask,
+        guidance_scale=cfg_scale,
+        temperature=generation_temperature,
+        timesteps=future_generation_steps,
+        noise_schedule=mask_schedule,
+        seq_len=num_future_tokens,
+        uni_prompting=uni_prompting,
+        config=config,
     )
-    pred_future_image = vq_model.decode_code(generated_future_tokens_tensor[:, :128], shape=(8, 16))
+    gen_future_codes = torch.clamp(gen_future_codes.long(), min=0, max=config.model.mmada.codebook_size - 1)
+    pred_future_image = vq_model.decode_code(gen_future_codes, shape=future_token_shape)
     
     # 解码GT未来图像
-    gt_future_front = sample["future_front_image"].unsqueeze(0).to(device)
-    gt_future_tokens = vq_model.get_code(gt_future_front).long()
-    recon_gt_future = vq_model.decode_code(gt_future_tokens, shape=(8, 16))
+    recon_gt_future = vq_model.decode_code(gt_future_tokens, shape=future_token_shape)
     
     return {
         'generated_action_tokens': generated_action_tokens,
