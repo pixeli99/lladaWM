@@ -604,6 +604,19 @@ def main():
         future_front = navsim_batch["future_front_image"].to(accelerator.device, non_blocking=True)
         future_tokens = vq_model.get_code(future_front).long() + token_offset
 
+        (
+            future_masked_tokens,
+            future_labels,
+            _,
+            future_mask_prob,
+        ) = mask_or_random_replace_tokens(
+            future_tokens,
+            mask_id,
+            config,
+            mask_schedule=mask_schedule,
+            is_train=True,
+        )
+
         action_token_ids = []
         for tokens in navsim_batch["action_tokens"]:
             ids = [uni_prompting.text_tokenizer.convert_tokens_to_ids(token) for token in tokens]
@@ -615,21 +628,32 @@ def main():
             'navsim'
         )
         
-        # Add masking similar to prepare_inputs_and_labels_for_text
         b, l = input_ids_navsim.shape
         t = torch.rand(b, device=input_ids_navsim.device)
         p_mask = (1 - eps) * t + eps
         p_mask = p_mask[:, None].repeat(1, l)
 
         masked_indices = torch.rand((b, l), device=input_ids_navsim.device) < p_mask
-        # Replace tokens with mask_id
         noisy_batch = torch.where(masked_indices, mask_id, input_ids_navsim)
-        masked_indices = noisy_batch == mask_id
-        
-        # Keep prompt part unchanged (similar to prepare_inputs_and_labels_for_mmu)
         noisy_batch[prompt_masks.bool()] = input_ids_navsim[prompt_masks.bool()]
-        masked_indices = noisy_batch == mask_id
-        
+
+        soi_token_id = int(uni_prompting.sptids_dict['<|soi|>'].item())
+        future_len = future_tokens.shape[1]
+        future_mask_prob = future_mask_prob.to(p_mask.device)
+
+        for b_idx in range(b):
+            soi_positions = torch.nonzero(input_ids_navsim[b_idx] == soi_token_id, as_tuple=False).flatten()
+            if soi_positions.numel() == 0:
+                raise ValueError("NavSim sequence missing <|soi|> token needed to locate future image tokens.")
+            future_start = soi_positions[-1].item() + 1
+            future_end = future_start + future_len
+            if future_end > l:
+                raise ValueError("Future image token slice exceeds sequence length in NavSim prompt.")
+
+            noisy_batch[b_idx, future_start:future_end] = future_masked_tokens[b_idx]
+            labels_navsim[b_idx, future_start:future_end] = future_labels[b_idx]
+            p_mask[b_idx, future_start:future_end] = future_mask_prob[b_idx]
+
         return noisy_batch, labels_navsim, p_mask
 
     @torch.no_grad()
