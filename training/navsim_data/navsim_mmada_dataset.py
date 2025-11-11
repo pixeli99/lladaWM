@@ -55,10 +55,10 @@ class NavsimMMaDADataset(Dataset):
         sensor_blobs_path: str,
         transforms: Optional[NavsimSampleTransforms] = None,
         num_history_frames: int = 4,
-        num_future_frames: int = 8,
-        target_future_seconds: float = 4.0,
+        num_future_frames: int = 1,
+        target_future_seconds: float = 0.5,
         stitched_image_size: Tuple[int, int] = (1024, 256),
-        front_image_size: Tuple[int, int] = (256, 128),
+        front_image_size: Tuple[int, int] = (512, 256),
         history_image_transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
         future_image_transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
     ) -> None:
