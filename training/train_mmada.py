@@ -621,7 +621,8 @@ def main():
         for tokens in navsim_batch["action_tokens"]:
             ids = [uni_prompting.text_tokenizer.convert_tokens_to_ids(token) for token in tokens]
             action_token_ids.append(torch.tensor(ids, dtype=torch.long, device=accelerator.device))
-        action_token_tensor = torch.stack(action_token_ids, dim=0)
+        # important: stack action tokens along the second dimension
+        action_token_tensor = torch.stack(action_token_ids, dim=1)
 
         input_ids_navsim, prompt_masks, labels_navsim = uni_prompting(
             (history_tensor.long(), navsim_batch["prompt_text"], action_token_tensor, future_tokens.long()),
