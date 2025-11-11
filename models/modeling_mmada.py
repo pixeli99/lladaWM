@@ -224,7 +224,8 @@ class MMadaModelLM(LLaDAModelLM):
             p_mask_navsim=None,
             answer_lengths=None,
             t2i_masks=None,
-            answer_lengths_lm=None
+            answer_lengths_lm=None,
+            answer_lengths_navsim=None
             ):
         # attention bias, True for batch_size, 1, seq_len, seq_len  
         attention_bias = torch.ones(
@@ -294,8 +295,13 @@ class MMadaModelLM(LLaDAModelLM):
                 logits[start_navsim:end_navsim][masked_indices_navsim].contiguous().view(-1, self.output_size),
                 labels[start_navsim:end_navsim][masked_indices_navsim].contiguous().view(-1), ignore_index=-100, reduction='none'
                 )/p_mask_navsim[masked_indices_navsim]
-            denom = max(1, logits[start_navsim:end_navsim].shape[0] * logits[start_navsim:end_navsim].shape[1])
-            loss_navsim = loss_navsim.sum() / denom
+            
+            # Use answer_lengths_navsim for consistent normalization with MMU
+            if answer_lengths_navsim is not None:
+                answer_lengths_navsim = answer_lengths_navsim.to(masked_indices_navsim.device)
+                loss_navsim = torch.sum(loss_navsim / answer_lengths_navsim[masked_indices_navsim]) / (logits[start_navsim:end_navsim].shape[0])
+            else:
+                assert False, "answer_lengths_navsim is not provided"
         
         return logits, loss_t2i, loss_lm, loss_mmu, loss_navsim
 

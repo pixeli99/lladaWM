@@ -654,7 +654,12 @@ def main():
             labels_navsim[b_idx, future_start:future_end] = future_labels[b_idx]
             p_mask[b_idx, future_start:future_end] = future_mask_prob[b_idx]
 
-        return noisy_batch, labels_navsim, p_mask
+        # Calculate answer_lengths for consistent loss normalization with MMU
+        prompt_masks = prompt_masks.to(torch.int64)
+        answer_lengths_navsim = torch.sum((1 - prompt_masks), dim=-1, keepdim=True)
+        answer_lengths_navsim = answer_lengths_navsim.repeat(1, noisy_batch.shape[1])
+
+        return noisy_batch, labels_navsim, p_mask, answer_lengths_navsim
 
     @torch.no_grad()
     def prepare_inputs_and_labels_for_mmu(
@@ -690,7 +695,7 @@ def main():
             model.train()
             for navsim_batch in navsim_loader:
                 data_time_m.update(time.time() - end_local)
-                input_ids_navsim, labels_navsim, p_mask_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
+                input_ids_navsim, labels_navsim, p_mask_navsim, answer_lengths_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
                 batch_size_navsim = input_ids_navsim.shape[0]
 
                 with accelerator.accumulate(model):
@@ -707,6 +712,7 @@ def main():
                         p_mask_navsim=p_mask_navsim,
                         answer_lengths=None,
                         t2i_masks=None,
+                        answer_lengths_navsim=answer_lengths_navsim,
                     )
                     loss = navsim_coeff * loss_navsim
                     accelerator.backward(loss)
@@ -869,9 +875,10 @@ def main():
             labels = torch.cat((labels, labels_mmu.to(input_ids.device)), dim=0)
 
             p_mask_navsim = None
+            answer_lengths_navsim = None
             if navsim_enabled:
                 navsim_batch = batch["navsim_flow"]
-                input_ids_navsim, labels_navsim, p_mask_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
+                input_ids_navsim, labels_navsim, p_mask_navsim, answer_lengths_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
                 batch_size_navsim = input_ids_navsim.shape[0]
                 input_ids = torch.cat((input_ids, input_ids_navsim.to(input_ids.device)), dim=0)
                 labels = torch.cat((labels, labels_navsim.to(input_ids.device)), dim=0)
@@ -893,7 +900,8 @@ def main():
                     p_mask_mmu=p_mask_mmu,
                     p_mask_navsim=p_mask_navsim,
                     answer_lengths=answer_lengths,
-                    t2i_masks=t2i_masks
+                    t2i_masks=t2i_masks,
+                    answer_lengths_navsim=answer_lengths_navsim
                 )
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss_t2i = accelerator.gather(loss_t2i.repeat(config.training.batch_size_t2i)).mean()
