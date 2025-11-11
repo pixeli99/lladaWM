@@ -414,29 +414,38 @@ def visualize_results(results, uni_prompting, save_path="navsim_inference_result
     pred_future_img = tensor_to_image(results['pred_future_image'])
     recon_gt_img = tensor_to_image(results['recon_gt_future'])
     
-    # 创建可视化
-    fig, axes = plt.subplots(2, num_hist + 1, figsize=(4 * (num_hist + 1), 8))
+    # 创建可视化（3行：历史帧+GT、历史帧+预测、历史帧+重建GT）
+    fig, axes = plt.subplots(3, num_hist + 1, figsize=(4 * (num_hist + 1), 12))
     
-    # 第一行：历史帧 + GT未来帧
+    # 第一行：历史帧 + GT未来帧（原始）
     for i in range(num_hist):
         axes[0, i].imshow(history_imgs[i])
-        axes[0, i].set_title(f'History Frame {i+1}')
+        axes[0, i].set_title(f'History Frame {i+1}', fontsize=10)
         axes[0, i].axis('off')
     axes[0, num_hist].imshow(gt_future_img)
-    axes[0, num_hist].set_title('GT Future Frame')
+    axes[0, num_hist].set_title('GT Future Frame (Original)', fontsize=10, color='green')
     axes[0, num_hist].axis('off')
     
     # 第二行：历史帧（重复） + 预测未来帧
     for i in range(num_hist):
         axes[1, i].imshow(history_imgs[i])
-        axes[1, i].set_title(f'History Frame {i+1}')
+        axes[1, i].set_title(f'History Frame {i+1}', fontsize=10)
         axes[1, i].axis('off')
     axes[1, num_hist].imshow(pred_future_img)
-    axes[1, num_hist].set_title('Predicted Future Frame')
+    axes[1, num_hist].set_title('Predicted Future Frame', fontsize=10, color='blue')
     axes[1, num_hist].axis('off')
     
+    # 第三行：历史帧（重复） + VQ-VAE重建的GT未来帧
+    for i in range(num_hist):
+        axes[2, i].imshow(history_imgs[i])
+        axes[2, i].set_title(f'History Frame {i+1}', fontsize=10)
+        axes[2, i].axis('off')
+    axes[2, num_hist].imshow(recon_gt_img)
+    axes[2, num_hist].set_title('Reconstructed GT (VQ-VAE)', fontsize=10, color='orange')
+    axes[2, num_hist].axis('off')
+    
     plt.suptitle(f"NavSim Inference Result\nPrompt: {results['prompt_text']}", 
-                 fontsize=14, y=0.98)
+                 fontsize=14, y=0.99)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"\nVisualization saved to: {save_path}")
@@ -456,10 +465,10 @@ def main():
                        help="Path to checkpoint directory")
     parser.add_argument("--config_path", type=str, default=None,
                        help="Path to training config (will auto-detect from checkpoint if not provided)")
-    parser.add_argument("--sample_idx", type=int, default=0,
-                       help="Index of sample to visualize")
-    parser.add_argument("--output", type=str, default="navsim_inference_result.png",
-                       help="Output image path")
+    parser.add_argument("--sample_idx", type=int, default=None,
+                       help="Index of sample to visualize (if not provided, will process all samples)")
+    parser.add_argument("--output", type=str, default="navsim_inference_results",
+                       help="Output directory path for saving all results")
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device to use")
     parser.add_argument("--decoding_steps", type=int, default=128,
@@ -473,8 +482,15 @@ def main():
     parser.add_argument("--remasking", type=str, default="low_confidence",
                        choices=["low_confidence", "random"],
                        help="Remasking strategy for iterative decoding")
+    parser.add_argument("--max_samples", type=int, default=None,
+                       help="Maximum number of samples to process (for debugging)")
     
     args = parser.parse_args()
+    
+    # 创建输出目录
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {output_dir.absolute()}")
     
     # 1. 加载模型
     model, vq_model, uni_prompting, config = load_model_and_tokenizer(
@@ -503,39 +519,80 @@ def main():
         target_future_seconds=navsim_params.get("target_future_seconds", 4.0),
     )
     
-    # 3. 获取指定样本
+    # 3. 决定要处理的样本
     dataset = navsim_loader.dataset
-    if args.sample_idx < 0 or args.sample_idx >= len(dataset):
-        print(f"Sample {args.sample_idx} not found! Dataset size: {len(dataset)}")
-        return
-    print(f"Fetching sample {args.sample_idx} directly from dataset (size={len(dataset)})...")
-    sample = dataset[args.sample_idx]
     
-    # 4. 推理
-    print(f"\n{'='*80}")
-    print("RUNNING INFERENCE...")
-    print(f"{'='*80}")
+    if args.sample_idx is not None:
+        # 处理单个样本
+        if args.sample_idx < 0 or args.sample_idx >= len(dataset):
+            print(f"Sample {args.sample_idx} not found! Dataset size: {len(dataset)}")
+            return
+        sample_indices = [args.sample_idx]
+        print(f"Processing single sample: {args.sample_idx}")
+    else:
+        # 处理所有样本
+        num_samples = len(dataset)
+        if args.max_samples is not None:
+            num_samples = min(num_samples, args.max_samples)
+        sample_indices = list(range(num_samples))
+        print(f"Processing all samples: {num_samples} samples in total")
     
-    results = inference_navsim_sample(
-        model,
-        vq_model,
-        uni_prompting,
-        sample,
-        config,
-        device=args.device,
-        decoding_steps=args.decoding_steps,
-        block_length=args.block_length,
-        temperature=args.temperature,
-        cfg_scale=args.cfg_scale,
-        remasking=args.remasking,
-    )
+    # 4. 遍历所有样本进行推理
+    total_samples = len(sample_indices)
+    all_accuracies = []
     
-    # 5. 可视化
-    visualize_results(results, uni_prompting, save_path=args.output)
+    for idx, sample_idx in enumerate(sample_indices):
+        print(f"\n{'='*80}")
+        print(f"Processing sample {idx+1}/{total_samples} (dataset index: {sample_idx})")
+        print(f"{'='*80}")
+        
+        # 获取样本
+        sample = dataset[sample_idx]
+        
+        # 推理
+        results = inference_navsim_sample(
+            model,
+            vq_model,
+            uni_prompting,
+            sample,
+            config,
+            device=args.device,
+            decoding_steps=args.decoding_steps,
+            block_length=args.block_length,
+            temperature=args.temperature,
+            cfg_scale=args.cfg_scale,
+            remasking=args.remasking,
+        )
+        
+        # 保存可视化结果
+        save_path = output_dir / f"sample_{sample_idx:04d}.png"
+        visualize_results(results, uni_prompting, save_path=str(save_path))
+        
+        # 计算准确率
+        gt_action_ids = results.get('gt_action_token_ids', [])
+        pred_action_ids = results['generated_action_tokens']
+        if gt_action_ids:
+            matches = sum(1 for gt, pred in zip(gt_action_ids, pred_action_ids) if gt == pred)
+            accuracy = matches / len(gt_action_ids) * 100 if len(gt_action_ids) > 0 else 0
+            all_accuracies.append(accuracy)
+        
+        # 清理内存
+        torch.cuda.empty_cache()
     
+    # 5. 打印统计信息
     print(f"\n{'='*80}")
     print("INFERENCE COMPLETED!")
-    print(f"{'='*80}\n")
+    print(f"{'='*80}")
+    print(f"Total samples processed: {total_samples}")
+    print(f"Results saved to: {output_dir.absolute()}")
+    
+    if all_accuracies:
+        avg_accuracy = np.mean(all_accuracies)
+        print(f"\nAverage Action Accuracy: {avg_accuracy:.2f}%")
+        print(f"Min Accuracy: {min(all_accuracies):.2f}%")
+        print(f"Max Accuracy: {max(all_accuracies):.2f}%")
+    
+    print(f"\n{'='*80}\n")
 
 
 if __name__ == "__main__":
