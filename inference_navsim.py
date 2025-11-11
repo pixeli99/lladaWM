@@ -200,11 +200,11 @@ def inference_navsim_sample(
         prompt_token_ids = [uni_prompting.text_tokenizer.bos_token_id] + prompt_token_ids
     prompt_token_ids = prompt_token_ids + [uni_prompting.text_tokenizer.eos_token_id]
     
-    # max_text_len = max(1, uni_prompting.max_text_len - 1)
-    # if max_text_len >= len(prompt_token_ids):
-    #     prompt_token_ids = prompt_token_ids + [uni_prompting.text_tokenizer.eos_token_id] * (max_text_len - len(prompt_token_ids))
-    # else:
-    #     prompt_token_ids = prompt_token_ids[:max_text_len - 1] + [uni_prompting.text_tokenizer.eos_token_id]
+    max_text_len = max(1, uni_prompting.max_text_len - 1)
+    if max_text_len >= len(prompt_token_ids):
+        prompt_token_ids = prompt_token_ids + [uni_prompting.text_tokenizer.eos_token_id] * (max_text_len - len(prompt_token_ids))
+    else:
+        prompt_token_ids = prompt_token_ids[:max_text_len - 1] + [uni_prompting.text_tokenizer.eos_token_id]
     prompt_ids = torch.tensor(prompt_token_ids, device=device, dtype=torch.long).unsqueeze(0)
     
     # 构建初始输入
@@ -248,30 +248,49 @@ def inference_navsim_sample(
             f"but generation uses fixed length {num_action_tokens}."
         )
 
-    action_start = input_ids.shape[1]
-    action_clamp_ranges = [
-        (
-            action_start,
-            action_start + num_action_tokens,
-            action_id_min,
-            action_id_max,
-        )
+    # ====================================================================
+    # COMMENTED OUT: Action generation (using GT actions instead for debugging)
+    # ====================================================================
+    # action_start = input_ids.shape[1]
+    # action_clamp_ranges = [
+    #     (
+    #         action_start,
+    #         action_start + num_action_tokens,
+    #         action_id_min,
+    #         action_id_max,
+    #     )
+    # ]
+    # 
+    # actions_full = model.mmu_generate(
+    #     idx=input_ids,
+    #     max_new_tokens=num_action_tokens + 3 + 128,
+    #     steps=147,
+    #     block_length=147,
+    #     temperature=temperature,
+    #     cfg_scale=cfg_scale,
+    #     remasking=remasking,
+    #     mask_id=mask_token_id,
+    #     clamp_ranges=action_clamp_ranges,
+    # )
+    # 
+    # generated_actions_tensor = actions_full[:, action_start:action_start + num_action_tokens]
+    # generated_action_tokens = generated_actions_tensor[0].tolist()
+    # ====================================================================
+    
+    # Use GT actions instead
+    gt_action_token_ids = [
+        uni_prompting.text_tokenizer.convert_tokens_to_ids(token) 
+        for token in gt_action_tokens
     ]
-
-    actions_full = model.mmu_generate(
-        idx=input_ids,
-        max_new_tokens=num_action_tokens + 3 + 128,
-        steps=147,
-        block_length=147,
-        temperature=temperature,
-        cfg_scale=cfg_scale,
-        remasking=remasking,
-        mask_id=mask_token_id,
-        clamp_ranges=action_clamp_ranges,
-    )
-
-    generated_actions_tensor = actions_full[:, action_start:action_start + num_action_tokens]
-    generated_action_tokens = generated_actions_tensor[0].tolist()
+    generated_actions_tensor = torch.tensor(
+        gt_action_token_ids, 
+        dtype=torch.long, 
+        device=device
+    ).unsqueeze(0)
+    generated_action_tokens = gt_action_token_ids
+    
+    print(f"Using GT actions: {gt_action_tokens}")
+    print(f"GT action token IDs: {gt_action_token_ids}")
 
     masked_future_tokens = torch.full(
         (history_tensor.shape[0], num_future_tokens),
