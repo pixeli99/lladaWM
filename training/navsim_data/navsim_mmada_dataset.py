@@ -61,16 +61,18 @@ class NavsimMMaDADataset(Dataset):
         front_image_size: Tuple[int, int] = (512, 256),
         history_image_transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
         future_image_transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
+        predict_future_image: bool = True,
     ) -> None:
         super().__init__()
         tfm = transforms or NavsimSampleTransforms()
-        
+
         # Use provided transforms or default normalized transforms
         if history_image_transform is None:
             history_image_transform = _default_navsim_image_transform()
         if future_image_transform is None:
             future_image_transform = _default_navsim_image_transform()
-        
+
+        self.predict_future_image = bool(predict_future_image)
         self.dataset = NavsimOnlineDataset(
             json_path=json_path,
             navsim_log_path=navsim_log_path,
@@ -129,12 +131,13 @@ class NavsimMMaDADataset(Dataset):
             "history_status": sample["history_status"],
             "history_trajectory": sample["history_trajectory"],
             "history_timestamps": sample["history_timestamps"],
-            "future_front_image": sample.get("future_front_image"),
             "action_tokens": action_tokens,
             "prompt_text": self._build_prompt(sample),
             "target_future_seconds": torch.tensor(self.target_future_seconds, dtype=torch.float32),
             "metadata": sample["metadata"],
         }
+        if self.predict_future_image and "future_front_image" in sample:
+            record["future_front_image"] = sample["future_front_image"]
         return record
 
 

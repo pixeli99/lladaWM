@@ -432,7 +432,7 @@ class UniversalPrompting():
         
     
 
-    def navsim_prompt(self, history_image_ids, text_ids, action_token_ids, future_image_ids):
+    def navsim_prompt(self, history_image_ids, text_ids, action_token_ids, future_image_ids=None):
         device = history_image_ids.device
         sequence_ids = []
         prompt_masks = []
@@ -455,9 +455,11 @@ class UniversalPrompting():
             text_tensor = torch.tensor(tokens, device=device)
             history_tokens = history_image_ids[i].to(device)
             action_tokens = action_token_ids[i].to(device)
-            future_tokens = future_image_ids[i].to(device)
+            future_tokens = None
+            if future_image_ids is not None:
+                future_tokens = future_image_ids[i].to(device)
 
-            seq = torch.cat([
+            seq_parts = [
                 self.sptids_dict['<|navsim|>'].to(device),
                 self.sptids_dict['<|soi|>'].to(device),
                 history_tokens,
@@ -465,11 +467,17 @@ class UniversalPrompting():
                 text_tensor,
                 self.sptids_dict['<nav_action_sep>'].to(device),
                 action_tokens,
-                self.sptids_dict['<nav_future_sep>'].to(device),
-                self.sptids_dict['<|soi|>'].to(device),
-                future_tokens,
-                self.sptids_dict['<|eoi|>'].to(device),
-            ], dim=0)
+            ]
+
+            if future_tokens is not None:
+                seq_parts.extend([
+                    self.sptids_dict['<nav_future_sep>'].to(device),
+                    self.sptids_dict['<|soi|>'].to(device),
+                    future_tokens,
+                    self.sptids_dict['<|eoi|>'].to(device),
+                ])
+
+            seq = torch.cat(seq_parts, dim=0)
 
             prefix_length = (
                 1  # <|navsim|>

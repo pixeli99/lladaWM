@@ -25,18 +25,19 @@ def parse_args() -> argparse.Namespace:
 
 def describe_batch(batch: dict[str, object]) -> None:
     history_front: torch.Tensor = batch["history_front_images"]
-    future_front: torch.Tensor = batch["future_front_image"]
     history_status: torch.Tensor = batch["history_status"]
     history_traj: torch.Tensor = batch["history_trajectory"]
     action_tokens = batch["action_tokens"]
     prompt_text = batch["prompt_text"]
     metadata = batch["metadata"]
+    future_front = batch.get("future_front_image")
 
     batch_size = history_front.shape[0]
     for idx in range(batch_size):
         print(f"Sample {idx}")
         print("  history_front_images:", tuple(history_front[idx].shape))
-        print("  future_front_image:", tuple(future_front[idx].shape))
+        if future_front is not None:
+            print("  future_front_image:", tuple(future_front[idx].shape))
         print("  history_status:", tuple(history_status[idx].shape))
         print("  history_trajectory:", tuple(history_traj[idx].shape))
         print("  action_tokens:", action_tokens[idx])

@@ -413,8 +413,10 @@ def main():
         train_dataloader_mmu = None
 
     navsim_loader = None
+    navsim_predict_future_image = True
     if navsim_enabled:
         navsim_params = OmegaConf.to_container(navsim_cfg, resolve=True)
+        navsim_predict_future_image = bool(navsim_params.get("predict_future_image", True))
         navsim_loader = create_navsim_mmada_dataloader(
             json_path=navsim_params["json_path"],
             navsim_log_path=navsim_params["navsim_log_path"],
@@ -428,6 +430,7 @@ def main():
             num_history_frames=navsim_params.get("num_history_frames", 4),
             num_future_frames=navsim_params.get("num_future_frames", 8),
             target_future_seconds=navsim_params.get("target_future_seconds", 4.0),
+            predict_future_image=navsim_predict_future_image,
         )
 
     # LLM pure text dataset: RefinedWeb
@@ -601,21 +604,27 @@ def main():
             history_tensor.append(seq)
         history_tensor = torch.stack(history_tensor, dim=0)
 
-        future_front = navsim_batch["future_front_image"].to(accelerator.device, non_blocking=True)
-        future_tokens = vq_model.get_code(future_front).long() + token_offset
+        has_future_targets = navsim_predict_future_image and ("future_front_image" in navsim_batch)
+        future_tokens = None
+        future_masked_tokens = None
+        future_labels = None
+        future_mask_prob = None
+        if has_future_targets:
+            future_front = navsim_batch["future_front_image"].to(accelerator.device, non_blocking=True)
+            future_tokens = vq_model.get_code(future_front).long() + token_offset
 
-        (
-            future_masked_tokens,
-            future_labels,
-            _,
-            future_mask_prob,
-        ) = mask_or_random_replace_tokens(
-            future_tokens,
-            mask_id,
-            config,
-            mask_schedule=mask_schedule,
-            is_train=True,
-        )
+            (
+                future_masked_tokens,
+                future_labels,
+                _,
+                future_mask_prob,
+            ) = mask_or_random_replace_tokens(
+                future_tokens,
+                mask_id,
+                config,
+                mask_schedule=mask_schedule,
+                is_train=True,
+            )
 
         action_token_ids = []
         for tokens in navsim_batch["action_tokens"]:
@@ -624,8 +633,14 @@ def main():
         # important: stack action tokens along the second dimension
         action_token_tensor = torch.stack(action_token_ids, dim=1)
 
+        navsim_prompt_inputs = (
+            history_tensor.long(),
+            navsim_batch["prompt_text"],
+            action_token_tensor,
+            future_tokens.long() if has_future_targets else None,
+        )
         input_ids_navsim, prompt_masks, labels_navsim = uni_prompting(
-            (history_tensor.long(), navsim_batch["prompt_text"], action_token_tensor, future_tokens.long()),
+            navsim_prompt_inputs,
             'navsim'
         )
         
@@ -638,22 +653,23 @@ def main():
         noisy_batch = torch.where(masked_indices, mask_id, input_ids_navsim)
         noisy_batch[prompt_masks.bool()] = input_ids_navsim[prompt_masks.bool()]
 
-        soi_token_id = int(uni_prompting.sptids_dict['<|soi|>'].item())
-        future_len = future_tokens.shape[1]
-        future_mask_prob = future_mask_prob.to(p_mask.device)
+        if has_future_targets:
+            soi_token_id = int(uni_prompting.sptids_dict['<|soi|>'].item())
+            future_len = future_tokens.shape[1]
+            future_mask_prob = future_mask_prob.to(p_mask.device)
 
-        for b_idx in range(b):
-            soi_positions = torch.nonzero(input_ids_navsim[b_idx] == soi_token_id, as_tuple=False).flatten()
-            if soi_positions.numel() == 0:
-                raise ValueError("NavSim sequence missing <|soi|> token needed to locate future image tokens.")
-            future_start = soi_positions[-1].item() + 1
-            future_end = future_start + future_len
-            if future_end > l:
-                raise ValueError("Future image token slice exceeds sequence length in NavSim prompt.")
+            for b_idx in range(b):
+                soi_positions = torch.nonzero(input_ids_navsim[b_idx] == soi_token_id, as_tuple=False).flatten()
+                if soi_positions.numel() < 2:
+                    raise ValueError("NavSim sequence missing future <|soi|> token needed to locate future image tokens.")
+                future_start = soi_positions[-1].item() + 1
+                future_end = future_start + future_len
+                if future_end > l:
+                    raise ValueError("Future image token slice exceeds sequence length in NavSim prompt.")
 
-            noisy_batch[b_idx, future_start:future_end] = future_masked_tokens[b_idx]
-            labels_navsim[b_idx, future_start:future_end] = future_labels[b_idx]
-            p_mask[b_idx, future_start:future_end] = future_mask_prob[b_idx]
+                noisy_batch[b_idx, future_start:future_end] = future_masked_tokens[b_idx]
+                labels_navsim[b_idx, future_start:future_end] = future_labels[b_idx]
+                p_mask[b_idx, future_start:future_end] = future_mask_prob[b_idx]
 
         # Calculate answer_lengths for consistent loss normalization with MMU
         prompt_masks = prompt_masks.to(torch.int64)
