@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -63,6 +64,7 @@ class NavsimOnlineDataset(Dataset):
             raise ValueError("At least one of include_front / include_stitched must be True.")
 
         self.sample_rel = _load_sample_list(json_path)
+        random.shuffle(self.sample_rel)
         logger.info("[NavSim] Loaded %d sample entries from %s", len(self.sample_rel), json_path)
 
         self.num_history_frames = int(num_history_frames)
@@ -415,4 +417,3 @@ def create_navsim_future_prediction_dataloader(
         drop_last=drop_last,
         collate_fn=collate_fn,
     )
-
