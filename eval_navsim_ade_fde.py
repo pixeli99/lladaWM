@@ -191,29 +191,10 @@ def predict_trajectory(
     ]
     
     # Generate
-    # Note: steps and block_length are hyperparameters. 
-    # Using values from inference_navsim.py commented code or defaults.
-    # inference_navsim.py used steps=147, block_length=147 in commented code.
-    # But standard generation usually uses fewer steps for actions if they are short?
-    # Actually, mmu_generate is for Masked Generative Models.
-    # If the model is autoregressive for actions, we should use a different generate.
-    # But MMaDA is likely Masked.
-    
-    # Let's use the parameters from the commented out code in inference_navsim.py as a baseline
-    # steps=147 seems high for 16 tokens? Maybe it includes the whole sequence?
-    # No, max_new_tokens=num_action_tokens + 3 + 128.
-    
-    # Let's use reasonable defaults or args
-    steps = 16 # Usually equal to sequence length for AR-like behavior in MaskGIT, or less for parallel.
-    # But the commented code had steps=147.
-    # Let's check if we can pass these as arguments.
-    
     actions_full = model.mmu_generate(
         idx=input_ids,
-        max_new_tokens=num_action_tokens, # We only want actions
-        steps=num_action_tokens, # Fully autoregressive-like or parallel? 
-        # If we want high quality, maybe more steps?
-        # Let's stick to a safe default.
+        max_new_tokens=num_action_tokens, 
+        steps=num_action_tokens, 
         temperature=temperature,
         cfg_scale=cfg_scale,
         remasking="low_confidence",
@@ -227,10 +208,6 @@ def predict_trajectory(
     # Convert IDs to tokens
     generated_tokens = []
     for tid in generated_action_ids:
-        # Handle if tid is out of vocab or special
-        token = uni_prompting.text_tokenizer.decode([tid], skip_special_tokens=False)
-        # decode might return " <bev_0>" with space.
-        # Better use convert_ids_to_tokens
         token = uni_prompting.text_tokenizer.convert_ids_to_tokens(tid)
         generated_tokens.append(token)
         
@@ -300,28 +277,23 @@ def main():
         for i in tqdm(range(num_samples)):
             sample = dataset[i]
             
-            try:
-                pred_traj, gt_traj, pred_tokens, gt_tokens = predict_trajectory(
-                    model, vq_model, uni_prompting, sample, config,
-                    device=args.device,
-                    temperature=args.temperature,
-                    cfg_scale=args.cfg_scale
-                )
+            pred_traj, gt_traj, pred_tokens, gt_tokens = predict_trajectory(
+                model, vq_model, uni_prompting, sample, config,
+                device=args.device,
+                temperature=args.temperature,
+                cfg_scale=args.cfg_scale
+            )
+            
+            ade, fde = calculate_ade_fde(pred_traj, gt_traj)
+            
+            if ade is not None:
+                ade_list.append(ade)
+                fde_list.append(fde)
                 
-                ade, fde = calculate_ade_fde(pred_traj, gt_traj)
-                
-                if ade is not None:
-                    ade_list.append(ade)
-                    fde_list.append(fde)
-                    
-                    # Log to file
-                    gt_str = " ".join(gt_tokens)
-                    pred_str = " ".join(pred_tokens)
-                    f.write(f"{i}\t{ade:.4f}\t{fde:.4f}\t{gt_str}\t{pred_str}\n")
-                    
-            except Exception as e:
-                print(f"Error processing sample {i}: {e}")
-                continue
+                # Log to file
+                gt_str = " ".join(gt_tokens)
+                pred_str = " ".join(pred_tokens)
+                f.write(f"{i}\t{ade:.4f}\t{fde:.4f}\t{gt_str}\t{pred_str}\n")
                 
     print("\n" + "="*40)
     print("EVALUATION RESULTS")
