@@ -198,6 +198,7 @@ def predict_trajectory(
         temperature=temperature,
         cfg_scale=cfg_scale,
         remasking="low_confidence",
+        block_length=num_action_tokens,
         mask_id=mask_token_id,
         clamp_ranges=action_clamp_ranges,
     )
