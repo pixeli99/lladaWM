@@ -275,7 +275,8 @@ def main():
     with open(args.output, "w") as f:
         f.write("Index\tADE\tFDE\tGT_Tokens\tPred_Tokens\n")
         
-        for i in tqdm(range(num_samples)):
+        pbar = tqdm(range(num_samples))
+        for i in pbar:
             sample = dataset[i]
             
             pred_traj, gt_traj, pred_tokens, gt_tokens = predict_trajectory(
@@ -290,6 +291,11 @@ def main():
             if ade is not None:
                 ade_list.append(ade)
                 fde_list.append(fde)
+                
+                # Update progress bar
+                mean_ade = np.mean(ade_list)
+                mean_fde = np.mean(fde_list)
+                pbar.set_description(f"ADE: {ade:.2f} (Avg: {mean_ade:.2f}) | FDE: {fde:.2f} (Avg: {mean_fde:.2f})")
                 
                 # Log to file
                 gt_str = " ".join(gt_tokens)
