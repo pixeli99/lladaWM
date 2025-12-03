@@ -767,7 +767,7 @@ def main():
                         navsim_action_mask=navsim_action_mask,
                         navsim_future_mask=navsim_future_mask,
                     )
-                    loss_navsim_total = loss_navsim_action + loss_navsim_future * 0.2
+                    loss_navsim_total = loss_navsim_action + loss_navsim_future
                     loss = navsim_coeff * loss_navsim_total
                     accelerator.backward(loss)
 

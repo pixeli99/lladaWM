@@ -327,7 +327,7 @@ class MMadaModelLM(LLaDAModelLM):
                     assert False, "answer_lengths_navsim is not provided"
 
             loss_navsim_action = _compute_navsim_loss(navsim_action_mask)
-            loss_navsim_future = _compute_navsim_loss(navsim_future_mask)
+            loss_navsim_future = _compute_navsim_loss(navsim_future_mask) * 0.2 # hard code
         
         return logits, loss_t2i, loss_lm, loss_mmu, loss_navsim_action, loss_navsim_future
 
