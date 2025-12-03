@@ -643,6 +643,34 @@ def main():
             navsim_prompt_inputs,
             'navsim'
         )
+
+        nav_action_sep_id = int(uni_prompting.sptids_dict['<nav_action_sep>'].item())
+        nav_future_sep_id = int(uni_prompting.sptids_dict['<nav_future_sep>'].item())
+        soi_token_id = int(uni_prompting.sptids_dict['<|soi|>'].item())
+
+        action_answer_mask = torch.zeros_like(input_ids_navsim, dtype=torch.bool)
+        future_answer_mask = torch.zeros_like(input_ids_navsim, dtype=torch.bool)
+
+        for b_idx in range(input_ids_navsim.shape[0]):
+            seq = input_ids_navsim[b_idx]
+            action_sep_positions = torch.nonzero(seq == nav_action_sep_id, as_tuple=False).flatten()
+            if action_sep_positions.numel() == 0:
+                continue
+
+            action_start = action_sep_positions[0].item() + 1
+            future_sep_positions = torch.nonzero(seq == nav_future_sep_id, as_tuple=False).flatten()
+            future_sep_idx = future_sep_positions[0].item() if future_sep_positions.numel() > 0 else None
+
+            if has_future_targets and future_sep_idx is not None:
+                action_end = future_sep_idx
+                future_len = future_tokens.shape[1]
+                future_start = future_sep_idx
+                future_end = min(seq.shape[0], future_start + future_len + 3)
+                future_answer_mask[b_idx, future_start:future_end] = True
+            else:
+                action_end = seq.shape[0]
+
+            action_answer_mask[b_idx, action_start:action_end] = True
         
         b, l = input_ids_navsim.shape
         t = torch.rand(b, device=input_ids_navsim.device)
@@ -654,7 +682,6 @@ def main():
         noisy_batch[prompt_masks.bool()] = input_ids_navsim[prompt_masks.bool()]
 
         if has_future_targets:
-            soi_token_id = int(uni_prompting.sptids_dict['<|soi|>'].item())
             future_len = future_tokens.shape[1]
             future_mask_prob = future_mask_prob.to(p_mask.device)
 
@@ -676,7 +703,7 @@ def main():
         answer_lengths_navsim = torch.sum((1 - prompt_masks), dim=-1, keepdim=True)
         answer_lengths_navsim = answer_lengths_navsim.repeat(1, noisy_batch.shape[1])
 
-        return noisy_batch, labels_navsim, p_mask, answer_lengths_navsim
+        return noisy_batch, labels_navsim, p_mask, answer_lengths_navsim, action_answer_mask, future_answer_mask
 
     @torch.no_grad()
     def prepare_inputs_and_labels_for_mmu(
@@ -712,11 +739,18 @@ def main():
             model.train()
             for navsim_batch in navsim_loader:
                 data_time_m.update(time.time() - end_local)
-                input_ids_navsim, labels_navsim, p_mask_navsim, answer_lengths_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
+                (
+                    input_ids_navsim,
+                    labels_navsim,
+                    p_mask_navsim,
+                    answer_lengths_navsim,
+                    navsim_action_mask,
+                    navsim_future_mask,
+                ) = prepare_inputs_and_labels_for_navsim(navsim_batch)
                 batch_size_navsim = input_ids_navsim.shape[0]
 
                 with accelerator.accumulate(model):
-                    logits, loss_t2i, loss_lm, loss_mmu, loss_navsim = model.forward_process(
+                    logits, loss_t2i, loss_lm, loss_mmu, loss_navsim_action, loss_navsim_future = model.forward_process(
                         input_ids=input_ids_navsim,
                         labels=labels_navsim,
                         batch_size_t2i=0,
@@ -730,8 +764,11 @@ def main():
                         answer_lengths=None,
                         t2i_masks=None,
                         answer_lengths_navsim=answer_lengths_navsim,
+                        navsim_action_mask=navsim_action_mask,
+                        navsim_future_mask=navsim_future_mask,
                     )
-                    loss = navsim_coeff * loss_navsim
+                    loss_navsim_total = loss_navsim_action + loss_navsim_future * 0.2
+                    loss = navsim_coeff * loss_navsim_total
                     accelerator.backward(loss)
 
                     if config.training.max_grad_norm is not None and accelerator.sync_gradients:
@@ -745,9 +782,13 @@ def main():
                     batch_time_m.update(time.time() - end_local)
                     end_local = time.time()
 
-                    avg_loss_navsim = accelerator.gather(
-                        loss_navsim.repeat(max(1, batch_size_navsim))
+                    avg_loss_navsim_action = accelerator.gather(
+                        loss_navsim_action.repeat(max(1, batch_size_navsim))
                     ).mean()
+                    avg_loss_navsim_future = accelerator.gather(
+                        loss_navsim_future.repeat(max(1, batch_size_navsim))
+                    ).mean()
+                    avg_loss_navsim = avg_loss_navsim_action + avg_loss_navsim_future
                     if (global_step + 1) % config.experiment.log_every == 0:
                         samples_per_second_per_gpu = (
                             config.training.gradient_accumulation_steps
@@ -756,6 +797,8 @@ def main():
                         )
                         logs = {
                             "step_loss_navsim": avg_loss_navsim.item(),
+                            "step_loss_navsim_action": avg_loss_navsim_action.item(),
+                            "step_loss_navsim_future": avg_loss_navsim_future.item(),
                             "lr": lr_scheduler.get_last_lr()[0],
                             "samples/sec/gpu": samples_per_second_per_gpu,
                             "data_time": data_time_m.val,
@@ -765,6 +808,7 @@ def main():
                         logger.info(
                             f"Step: {global_step + 1} "
                             f"Loss_navsim: {avg_loss_navsim.item():0.4f} "
+                            f"(action={avg_loss_navsim_action.item():0.4f}, future={avg_loss_navsim_future.item():0.4f}) "
                             f"Data (t): {data_time_m.val:0.4f}, {samples_per_second_per_gpu:0.2f}/s/gpu "
                             f"Batch (t): {batch_time_m.val:0.4f} "
                             f"LR: {lr_scheduler.get_last_lr()[0]:0.6f}"
@@ -893,9 +937,18 @@ def main():
 
             p_mask_navsim = None
             answer_lengths_navsim = None
+            navsim_action_mask = None
+            navsim_future_mask = None
             if navsim_enabled:
                 navsim_batch = batch["navsim_flow"]
-                input_ids_navsim, labels_navsim, p_mask_navsim, answer_lengths_navsim = prepare_inputs_and_labels_for_navsim(navsim_batch)
+                (
+                    input_ids_navsim,
+                    labels_navsim,
+                    p_mask_navsim,
+                    answer_lengths_navsim,
+                    navsim_action_mask,
+                    navsim_future_mask,
+                ) = prepare_inputs_and_labels_for_navsim(navsim_batch)
                 batch_size_navsim = input_ids_navsim.shape[0]
                 input_ids = torch.cat((input_ids, input_ids_navsim.to(input_ids.device)), dim=0)
                 labels = torch.cat((labels, labels_navsim.to(input_ids.device)), dim=0)
@@ -905,7 +958,7 @@ def main():
                 logger.info("Labels: {}".format(labels))
 
             with accelerator.accumulate(model):
-                logits, loss_t2i, loss_lm, loss_mmu, loss_navsim = model.forward_process(
+                logits, loss_t2i, loss_lm, loss_mmu, loss_navsim_action, loss_navsim_future = model.forward_process(
                     input_ids=input_ids,
                     labels=labels,
                     batch_size_t2i=batch_size_t2i,
@@ -918,20 +971,27 @@ def main():
                     p_mask_navsim=p_mask_navsim,
                     answer_lengths=answer_lengths,
                     t2i_masks=t2i_masks,
-                    answer_lengths_navsim=answer_lengths_navsim
+                    answer_lengths_navsim=answer_lengths_navsim,
+                    navsim_action_mask=navsim_action_mask,
+                    navsim_future_mask=navsim_future_mask
                 )
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss_t2i = accelerator.gather(loss_t2i.repeat(config.training.batch_size_t2i)).mean()
                 avg_loss_lm = accelerator.gather(loss_lm.repeat(config.training.batch_size_lm)).mean()
                 avg_loss_mmu = accelerator.gather(loss_mmu.repeat(config.training.batch_size_mmu)).mean()
                 if batch_size_navsim > 0:
-                    avg_loss_navsim = accelerator.gather(loss_navsim.repeat(batch_size_navsim)).mean()
+                    avg_loss_navsim_action = accelerator.gather(loss_navsim_action.repeat(batch_size_navsim)).mean()
+                    avg_loss_navsim_future = accelerator.gather(loss_navsim_future.repeat(batch_size_navsim)).mean()
+                    avg_loss_navsim = avg_loss_navsim_action + avg_loss_navsim_future
                 else:
+                    avg_loss_navsim_action = torch.tensor(0.0, device=accelerator.device)
+                    avg_loss_navsim_future = torch.tensor(0.0, device=accelerator.device)
                     avg_loss_navsim = torch.tensor(0.0, device=accelerator.device)
+                loss_navsim_total = loss_navsim_action + loss_navsim_future
                 loss = config.training.t2i_coeff * loss_t2i + \
                        config.training.lm_coeff * loss_lm + \
                        config.training.mmu_coeff * loss_mmu + \
-                       navsim_coeff * loss_navsim
+                       navsim_coeff * loss_navsim_total
 
                 avg_masking_rate = accelerator.gather(mask_prob.repeat(config.training.batch_size_t2i)).mean()
 
@@ -969,6 +1029,8 @@ def main():
                         "step_loss_mmu": avg_loss_mmu.item(),
                         "step_loss_lm": avg_loss_lm.item(),
                         "step_loss_navsim": avg_loss_navsim.item(),
+                        "step_loss_navsim_action": avg_loss_navsim_action.item(),
+                        "step_loss_navsim_future": avg_loss_navsim_future.item(),
                         "lr": lr_scheduler.get_last_lr()[0],
                         "avg_masking_rate": avg_masking_rate.item(),
                         "samples/sec/gpu": samples_per_second_per_gpu,
@@ -983,6 +1045,7 @@ def main():
                         f"Loss_mmu: {avg_loss_mmu.item():0.4f} "
                         f"Loss_lm: {avg_loss_lm.item():0.4f} "
                         f"Loss_navsim: {avg_loss_navsim.item():0.4f} "
+                        f"(action={avg_loss_navsim_action.item():0.4f}, future={avg_loss_navsim_future.item():0.4f}) "
                         f"Data (t): {data_time_m.val:0.4f}, {samples_per_second_per_gpu:0.2f}/s/gpu "
                         f"Batch (t): {batch_time_m.val:0.4f} "
                         f"LR: {lr_scheduler.get_last_lr()[0]:0.6f}"

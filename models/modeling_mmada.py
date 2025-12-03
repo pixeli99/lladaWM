@@ -225,7 +225,9 @@ class MMadaModelLM(LLaDAModelLM):
             answer_lengths=None,
             t2i_masks=None,
             answer_lengths_lm=None,
-            answer_lengths_navsim=None
+            answer_lengths_navsim=None,
+            navsim_action_mask=None,
+            navsim_future_mask=None
             ):
         # attention bias, True for batch_size, 1, seq_len, seq_len  
         attention_bias = torch.ones(
@@ -287,23 +289,47 @@ class MMadaModelLM(LLaDAModelLM):
             loss_mmu = torch.sum(loss_mmu/answer_lengths[masked_indices_mmu]) / (logits[start_mmu:end_mmu].shape[0])
 
         if batch_size_navsim == 0:
-            loss_navsim = torch.tensor(0.0, device=input_ids.device)
+            loss_navsim_action = torch.tensor(0.0, device=input_ids.device)
+            loss_navsim_future = torch.tensor(0.0, device=input_ids.device)
         else:
             masked_indices_navsim = masked_indices[start_navsim:end_navsim]
             p_mask_navsim = p_mask_navsim.to(masked_indices_navsim.device)
-            loss_navsim = F.cross_entropy(
-                logits[start_navsim:end_navsim][masked_indices_navsim].contiguous().view(-1, self.output_size),
-                labels[start_navsim:end_navsim][masked_indices_navsim].contiguous().view(-1), ignore_index=-100, reduction='none'
-                )/p_mask_navsim[masked_indices_navsim]
-            
-            # Use answer_lengths_navsim for consistent normalization with MMU
-            if answer_lengths_navsim is not None:
-                answer_lengths_navsim = answer_lengths_navsim.to(masked_indices_navsim.device)
-                loss_navsim = torch.sum(loss_navsim / answer_lengths_navsim[masked_indices_navsim]) / (logits[start_navsim:end_navsim].shape[0])
-            else:
-                assert False, "answer_lengths_navsim is not provided"
+            answer_lengths_navsim = (
+                answer_lengths_navsim.to(masked_indices_navsim.device)
+                if answer_lengths_navsim is not None
+                else None
+            )
+
+            if navsim_action_mask is None:
+                raise ValueError("navsim_action_mask is required when batch_size_navsim > 0")
+            navsim_action_mask = navsim_action_mask.to(masked_indices_navsim.device)
+            navsim_future_mask = (
+                navsim_future_mask.to(masked_indices_navsim.device)
+                if navsim_future_mask is not None
+                else torch.zeros_like(masked_indices_navsim)
+            )
+
+            def _compute_navsim_loss(component_mask):
+                component_mask = component_mask & masked_indices_navsim
+                if not component_mask.any():
+                    return torch.tensor(0.0, device=input_ids.device)
+                loss = F.cross_entropy(
+                    logits[start_navsim:end_navsim][component_mask].contiguous().view(-1, self.output_size),
+                    labels[start_navsim:end_navsim][component_mask].contiguous().view(-1),
+                    ignore_index=-100,
+                    reduction='none'
+                    ) / p_mask_navsim[component_mask]
+
+                # Use answer_lengths_navsim for consistent normalization with MMU
+                if answer_lengths_navsim is not None:
+                    return torch.sum(loss / answer_lengths_navsim[component_mask]) / (logits[start_navsim:end_navsim].shape[0])
+                else:
+                    assert False, "answer_lengths_navsim is not provided"
+
+            loss_navsim_action = _compute_navsim_loss(navsim_action_mask)
+            loss_navsim_future = _compute_navsim_loss(navsim_future_mask)
         
-        return logits, loss_t2i, loss_lm, loss_mmu, loss_navsim
+        return logits, loss_t2i, loss_lm, loss_mmu, loss_navsim_action, loss_navsim_future
 
     def forward_process_with_r2i(
             self,
