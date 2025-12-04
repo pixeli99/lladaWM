@@ -115,8 +115,9 @@ class NavsimMMaDADataset(Dataset):
         dir_text = directions[max(0, min(len(directions) - 1, dir_idx))]
         prompt.append(f"You plan to take the following action: {dir_text}.")
 
-        # Include sampled trajectory summary
-        prompt.append(f"Recent trajectory (ego frame): {_format_trajectory(history_traj)}.")
+        # Include sampled trajectory as BEV tokens for exact reproducibility
+        history_traj_tokens = trajectory_to_bev_tokens(history_traj)
+        prompt.append(f"Recent trajectory (ego frame) tokens: {' '.join(history_traj_tokens)}.")
 
         return " ".join(prompt)
 
