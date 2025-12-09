@@ -204,6 +204,34 @@ def main():
 
     mask_id = model.config.mask_token_id
 
+    # Precompute BEV token -> coordinate lookup for NavSim metrics
+    bev_bins = torch.tensor(np.arange(-100.0, 100.0 + 1e-6, 0.3), device=accelerator.device)
+    bev_id_to_bin_idx = torch.full((model.config.vocab_size,), -1, device=accelerator.device, dtype=torch.long)
+    for tok in action_token_vocab():
+        tok_id = tokenizer.convert_tokens_to_ids(tok)
+        if tok_id is None or tok_id < 0 or tok_id >= bev_id_to_bin_idx.shape[0]:
+            continue
+        try:
+            bin_idx = int(tok[5:-1])
+        except ValueError:
+            continue
+        bev_id_to_bin_idx[tok_id] = bin_idx
+
+    def navsim_tokens_to_xy(token_ids: torch.Tensor) -> torch.Tensor:
+        """Convert a 1D tensor of BEV token ids into (N, 2) xy coordinates (meters)."""
+        bin_idx = torch.full_like(token_ids, -1, device=token_ids.device)
+        valid_ids = (token_ids >= 0) & (token_ids < bev_id_to_bin_idx.shape[0])
+        bin_idx[valid_ids] = bev_id_to_bin_idx[token_ids[valid_ids]]
+        valid = bin_idx >= 0
+        if not torch.any(valid):
+            return torch.empty(0, 2, device=token_ids.device)
+        coord_1d = bev_bins[bin_idx[valid]]
+        num_pairs = coord_1d.numel() // 2
+        if num_pairs == 0:
+            return torch.empty(0, 2, device=token_ids.device)
+        coord_1d = coord_1d[: num_pairs * 2]
+        return coord_1d.view(num_pairs, 2)
+
     ##################################
     #   Optimizer and LR scheduler   #
     #################################
@@ -706,6 +734,36 @@ def main():
         return noisy_batch, labels_navsim, p_mask, answer_lengths_navsim, action_answer_mask, future_answer_mask
 
     @torch.no_grad()
+    def compute_navsim_ade_fde(logits_slice, labels_slice, action_mask_slice):
+        """Compute ADE/FDE on NavSim action tokens using argmax predictions; no gradient used."""
+        pred_ids = torch.argmax(logits_slice, dim=-1)
+        ade_vals = []
+        fde_vals = []
+        for b_idx in range(pred_ids.shape[0]):
+            mask = action_mask_slice[b_idx]
+            if not torch.any(mask):
+                continue
+            pred_xy = navsim_tokens_to_xy(pred_ids[b_idx][mask])
+            target_xy = navsim_tokens_to_xy(labels_slice[b_idx][mask])
+            if pred_xy.numel() == 0 or target_xy.numel() == 0:
+                continue
+            num_pairs = min(pred_xy.shape[0], target_xy.shape[0])
+            if num_pairs == 0:
+                continue
+            pred_xy = pred_xy[:num_pairs]
+            target_xy = target_xy[:num_pairs]
+            dist = torch.norm(pred_xy - target_xy, dim=-1)
+            ade_vals.append(dist.mean())
+            fde_vals.append(dist[-1])
+
+        if len(ade_vals) == 0:
+            return None, None
+
+        ade_stack = torch.stack(ade_vals)
+        fde_stack = torch.stack(fde_vals)
+        return ade_stack.mean(), fde_stack.mean()
+
+    @torch.no_grad()
     def prepare_inputs_and_labels_for_mmu(
         input_ids_mmu, prompt_masks, labels_mmu, eps=1e-3
     ):
@@ -768,6 +826,18 @@ def main():
                         navsim_future_mask=navsim_future_mask,
                     )
                     loss_navsim_total = loss_navsim_action + loss_navsim_future
+                    navsim_ade_mean = None
+                    navsim_fde_mean = None
+                    if (global_step + 1) % config.experiment.log_every == 0:
+                        ade_vals, fde_vals = compute_navsim_ade_fde(
+                            logits,
+                            labels_navsim,
+                            navsim_action_mask,
+                        )
+                        if ade_vals is not None:
+                            navsim_ade_mean = accelerator.gather(ade_vals).mean()
+                            navsim_fde_mean = accelerator.gather(fde_vals).mean()
+
                     loss = navsim_coeff * loss_navsim_total
                     accelerator.backward(loss)
 
@@ -804,6 +874,9 @@ def main():
                             "data_time": data_time_m.val,
                             "batch_time": batch_time_m.val,
                         }
+                        if navsim_ade_mean is not None:
+                            logs["navsim_ade"] = navsim_ade_mean.item()
+                            logs["navsim_fde"] = navsim_fde_mean.item()
                         accelerator.log(logs, step=global_step + 1)
                         logger.info(
                             f"Step: {global_step + 1} "
@@ -939,6 +1012,8 @@ def main():
             answer_lengths_navsim = None
             navsim_action_mask = None
             navsim_future_mask = None
+            labels_navsim = None
+            input_ids_navsim = None
             if navsim_enabled:
                 navsim_batch = batch["navsim_flow"]
                 (
@@ -952,6 +1027,9 @@ def main():
                 batch_size_navsim = input_ids_navsim.shape[0]
                 input_ids = torch.cat((input_ids, input_ids_navsim.to(input_ids.device)), dim=0)
                 labels = torch.cat((labels, labels_navsim.to(input_ids.device)), dim=0)
+
+            start_navsim = batch_size_t2i + batch_size_lm + batch_size_mmu
+            end_navsim = start_navsim + batch_size_navsim
             
             if global_step == 0 and epoch == 0:
                 logger.info("Input ids: {}".format(input_ids))
@@ -988,6 +1066,17 @@ def main():
                     avg_loss_navsim_future = torch.tensor(0.0, device=accelerator.device)
                     avg_loss_navsim = torch.tensor(0.0, device=accelerator.device)
                 loss_navsim_total = loss_navsim_action + loss_navsim_future
+                navsim_ade_mean = None
+                navsim_fde_mean = None
+                if batch_size_navsim > 0 and (global_step + 1) % config.experiment.log_every == 0:
+                    ade_vals, fde_vals = compute_navsim_ade_fde(
+                        logits[start_navsim:end_navsim],
+                        labels_navsim,
+                        navsim_action_mask,
+                    )
+                    if ade_vals is not None:
+                        navsim_ade_mean = accelerator.gather(ade_vals).mean()
+                        navsim_fde_mean = accelerator.gather(fde_vals).mean()
                 loss = config.training.t2i_coeff * loss_t2i + \
                        config.training.lm_coeff * loss_lm + \
                        config.training.mmu_coeff * loss_mmu + \
@@ -1037,6 +1126,9 @@ def main():
                         "data_time": data_time_m.val,
                         "batch_time": batch_time_m.val,
                     }
+                    if navsim_ade_mean is not None:
+                        logs["navsim_ade"] = navsim_ade_mean.item()
+                        logs["navsim_fde"] = navsim_fde_mean.item()
                     accelerator.log(logs, step=global_step + 1)
 
                     logger.info(
