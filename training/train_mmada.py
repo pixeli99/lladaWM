@@ -206,6 +206,7 @@ def main():
 
     # Precompute BEV token -> coordinate lookup for NavSim metrics
     bev_bins = torch.tensor(np.arange(-100.0, 100.0 + 1e-6, 0.3), device=accelerator.device)
+    bev_token_ids = []
     bev_id_to_bin_idx = torch.full((model.config.vocab_size,), -1, device=accelerator.device, dtype=torch.long)
     for tok in action_token_vocab():
         tok_id = tokenizer.convert_tokens_to_ids(tok)
@@ -216,6 +217,8 @@ def main():
         except ValueError:
             continue
         bev_id_to_bin_idx[tok_id] = bin_idx
+        bev_token_ids.append(tok_id)
+    bev_token_ids = torch.tensor(bev_token_ids, device=accelerator.device, dtype=torch.long)
 
     def navsim_tokens_to_xy(token_ids: torch.Tensor) -> torch.Tensor:
         """Convert a 1D tensor of BEV token ids into (N, 2) xy coordinates (meters)."""
@@ -734,9 +737,17 @@ def main():
         return noisy_batch, labels_navsim, p_mask, answer_lengths_navsim, action_answer_mask, future_answer_mask
 
     @torch.no_grad()
-    def compute_navsim_ade_fde(logits_slice, labels_slice, action_mask_slice):
-        """Compute ADE/FDE on NavSim action tokens using argmax predictions; no gradient used."""
-        pred_ids = torch.argmax(logits_slice, dim=-1)
+    def compute_navsim_ade_fde(logits_slice, labels_slice, input_ids_slice, action_mask_slice):
+        """Compute ADE/FDE on NavSim action tokens; unmasked positions use ground truth directly."""
+        if bev_token_ids.numel() == 0:
+            return None, None
+        # Restrict decoding to BEV token subset
+        bev_logits = logits_slice[..., bev_token_ids]
+        pred_local_idx = torch.argmax(bev_logits, dim=-1)
+        pred_ids = bev_token_ids[pred_local_idx]
+        # For positions that were not masked, replace predictions with ground truth to avoid penalizing teacher-forced tokens
+        not_masked = input_ids_slice != mask_id
+        pred_ids = torch.where(not_masked, labels_slice, pred_ids)
         ade_vals = []
         fde_vals = []
         for b_idx in range(pred_ids.shape[0]):
@@ -832,6 +843,7 @@ def main():
                         ade_vals, fde_vals = compute_navsim_ade_fde(
                             logits,
                             labels_navsim,
+                            input_ids_navsim,
                             navsim_action_mask,
                         )
                         if ade_vals is not None:
@@ -1072,6 +1084,7 @@ def main():
                     ade_vals, fde_vals = compute_navsim_ade_fde(
                         logits[start_navsim:end_navsim],
                         labels_navsim,
+                        input_ids_navsim,
                         navsim_action_mask,
                     )
                     if ade_vals is not None:
