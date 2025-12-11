@@ -117,7 +117,7 @@ class NavsimMMaDADataset(Dataset):
 
         # Include sampled trajectory as BEV tokens for exact reproducibility
         history_traj_tokens = trajectory_to_bev_tokens(history_traj)
-        prompt.append(f"Recent trajectory (ego frame) tokens: {' '.join(history_traj_tokens)}.")
+        prompt.append(f"Recent trajectory (ego frame) tokens: {''.join(history_traj_tokens)}.")
 
         return " ".join(prompt)
 
