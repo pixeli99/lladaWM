@@ -58,7 +58,7 @@ class NavsimMMaDADataset(Dataset):
         num_future_frames: int = 1,
         target_future_seconds: float = 0.5,
         stitched_image_size: Tuple[int, int] = (1024, 256),
-        front_image_size: Tuple[int, int] = (512, 256),
+        front_image_size: Tuple[int, int] = (256, 128),
         history_image_transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
         future_image_transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
         predict_future_image: bool = True,
